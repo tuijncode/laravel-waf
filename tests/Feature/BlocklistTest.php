@@ -22,6 +22,14 @@ it('supports CIDR ranges in the denylist', function () {
     $this->get('/')->assertForbidden();
 });
 
+it('refuses a denylisted IP with stray whitespace around the entry', function () {
+    // Untrimmed entries reach the middleware from stale published configs;
+    // the denylist must still match.
+    config()->set('waf.blocklisted_ips', [' 127.0.0.1 ']);
+
+    $this->get('/?q=hello')->assertForbidden();
+});
+
 it('lets a non-denylisted IP through', function () {
     config()->set('waf.blocklisted_ips', ['203.0.113.5']);
 

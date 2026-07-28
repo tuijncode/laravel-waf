@@ -4,6 +4,19 @@ All notable changes to `tuijncode/laravel-waf` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-07-28
+
+### Fixed
+
+- Whitelist and denylist entries are now trimmed at match time, in the
+  middleware itself. The shipped config already trims on parse (since 1.2.0),
+  but an application still running a published `config/waf.php` copy that
+  predates that fix passed untrimmed entries (`"1.2.3.4, 5.6.7.8"` split on
+  commas) straight to the IP check, where a space-prefixed entry silently
+  never matches — leaving a whitelist (or denylist) that had quietly stopped
+  working. Matching no longer depends on which copy of the config the
+  application has published.
+
 ## [1.2.0] - 2026-07-24
 
 ### Added
