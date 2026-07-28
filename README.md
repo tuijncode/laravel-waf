@@ -186,7 +186,9 @@ comma-separated env value (e.g. `WAF_BLOCKLISTED_IPS="203.0.113.4,10.0.0.0/8"`):
   either mode. It is an explicit operator decision independent of the scoring
   engine, so it blocks **even in `detection` mode**.
 
-If an address is on both lists the allowlist wins.
+If an address is on both lists the allowlist wins. Entries are trimmed before
+matching, so spaces after the commas are fine — even on an older published
+`config/waf.php` that doesn't trim on parse.
 
 ### Blocking & the block response
 

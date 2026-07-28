@@ -39,11 +39,11 @@ class WafMiddleware
         if (config('waf.enabled', true)) {
             $ip = (string) $request->ip();
 
-            if ($ip !== '' && IpUtils::checkIp($ip, (array) config('waf.whitelisted_ips', []))) {
+            if ($ip !== '' && $this->ipMatches($ip, config('waf.whitelisted_ips', []))) {
                 return $next($request);
             }
 
-            if ($ip !== '' && IpUtils::checkIp($ip, (array) config('waf.blocklisted_ips', []))) {
+            if ($ip !== '' && $this->ipMatches($ip, config('waf.blocklisted_ips', []))) {
                 Log::warning('laravel-waf: request refused (denylisted IP)', ['ip' => $ip]);
 
                 return $this->blockResponse($request, new InspectionResult);
@@ -137,6 +137,25 @@ class WafMiddleware
         return response($message, $status, $headers);
     }
 
+    /**
+     * Whether the IP matches any entry (exact or CIDR) in the configured list.
+     *
+     * Entries are trimmed before matching: IpUtils::checkIp() treats an entry
+     * with stray whitespace (" 1.2.3.4") as unparsable and silently never
+     * matches it. The shipped config trims on parse, but an application
+     * running a stale published copy of it would pass untrimmed entries here —
+     * and a whitelist that silently stopped matching must not take effect.
+     */
+    protected function ipMatches(string $ip, mixed $list): bool
+    {
+        $entries = array_filter(array_map(
+            static fn ($entry): string => is_string($entry) ? trim($entry) : '',
+            (array) $list,
+        ), static fn (string $entry): bool => $entry !== '');
+
+        return $entries !== [] && IpUtils::checkIp($ip, array_values($entries));
+    }
+
     protected function shouldInspect(Request $request): bool
     {
         if (! config('waf.enabled', true)) {
@@ -149,7 +168,7 @@ class WafMiddleware
         }
 
         $ip = (string) $request->ip();
-        if ($ip !== '' && IpUtils::checkIp($ip, config('waf.whitelisted_ips', []))) {
+        if ($ip !== '' && $this->ipMatches($ip, config('waf.whitelisted_ips', []))) {
             return false;
         }
 

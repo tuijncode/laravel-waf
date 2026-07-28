@@ -28,6 +28,17 @@ it('skips whitelisted IPs', function () use ($attack) {
     expect(DB::table('waf_logs')->count())->toBe(0);
 });
 
+it('skips whitelisted IPs with stray whitespace around the entry', function () use ($attack) {
+    // A stale published config predating the trim-on-parse fix hands the
+    // middleware untrimmed entries ("1.2.3.4, 5.6.7.8" split on commas);
+    // the whitelist must still match.
+    config()->set('waf.whitelisted_ips', [' 127.0.0.1 ']);
+
+    $this->get('/?'.$attack())->assertOk();
+
+    expect(DB::table('waf_logs')->count())->toBe(0);
+});
+
 it('skips paths matching skip_paths but inspects others', function () use ($attack) {
     config()->set('waf.skip_paths', ['ignored/*']);
 
