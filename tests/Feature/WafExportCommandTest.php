@@ -93,3 +93,28 @@ it('honours the days window', function () {
 it('rejects an unknown format', function () {
     expect(Artisan::call('waf:export', ['--format' => 'bogus']))->toBe(2);
 });
+
+it('renders the fail2ban set-banip format with the default jail', function () {
+    seedExportFinding('203.0.113.90', 'critical', hits: 10);
+
+    Artisan::call('waf:export', ['--format' => 'fail2ban']);
+
+    expect(Artisan::output())->toContain('fail2ban-client set laravel-waf banip 203.0.113.90');
+});
+
+it('uses a custom jail name in the fail2ban format', function () {
+    seedExportFinding('203.0.113.91', 'critical', hits: 10);
+
+    Artisan::call('waf:export', ['--format' => 'fail2ban', '--jail' => 'sshd']);
+
+    expect(Artisan::output())->toContain('fail2ban-client set sshd banip 203.0.113.91');
+});
+
+it('rejects a jail name that could break out of the shell command', function () {
+    seedExportFinding('203.0.113.92', 'critical', hits: 10);
+
+    $status = Artisan::call('waf:export', ['--format' => 'fail2ban', '--jail' => 'a; rm -rf /']);
+
+    expect($status)->toBe(2)
+        ->and(Artisan::output())->not->toContain('203.0.113.92');
+});

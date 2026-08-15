@@ -16,7 +16,8 @@ use Illuminate\Support\Facades\DB;
 class WafExportCommand extends Command
 {
     protected $signature = 'waf:export
-        {--format=plain : Output format: plain|nginx|apache|csv}
+        {--format=plain : Output format: plain|fail2ban|nginx|apache|csv}
+        {--jail=laravel-waf : fail2ban jail to ban into (fail2ban format only)}
         {--min-level=error : Minimum severity to include (notice|warning|error|critical)}
         {--days=0 : Only findings from the last N days (0 = all time)}
         {--min-hits=1 : Minimum total hit count per IP}
@@ -26,7 +27,7 @@ class WafExportCommand extends Command
 
     private const RANKS = ['notice' => 1, 'warning' => 2, 'error' => 3, 'critical' => 4];
 
-    private const FORMATS = ['plain', 'nginx', 'apache', 'csv'];
+    private const FORMATS = ['plain', 'fail2ban', 'nginx', 'apache', 'csv'];
 
     public function handle(): int
     {
@@ -35,6 +36,15 @@ class WafExportCommand extends Command
         $format = (string) $this->option('format');
         if (! in_array($format, self::FORMATS, true)) {
             $err->writeln("<error>Unknown format '{$format}' (allowed: ".implode(', ', self::FORMATS).').</error>');
+
+            return self::INVALID;
+        }
+
+        // The fail2ban output is shell commands meant to be piped into a shell,
+        // so the jail name (the only free-text value on those lines) is held to
+        // characters that can't break out of the command.
+        if ($format === 'fail2ban' && ! preg_match('/^[A-Za-z0-9._-]+$/', (string) $this->option('jail'))) {
+            $err->writeln('<error>Jail names may only contain letters, digits, dots, hyphens and underscores.</error>');
 
             return self::INVALID;
         }
@@ -104,6 +114,7 @@ class WafExportCommand extends Command
     private function render(string $format, Collection $rows): void
     {
         $labels = array_flip(self::RANKS);
+        $jail = (string) $this->option('jail');
 
         if ($format === 'csv') {
             $this->line('ip_address,hits,max_level,last_seen');
@@ -114,6 +125,7 @@ class WafExportCommand extends Command
             $level = $labels[(int) $row->lvl] ?? 'notice';
 
             $this->line(match ($format) {
+                'fail2ban' => "fail2ban-client set {$jail} banip {$ip}",
                 'nginx' => "deny {$ip};",
                 'apache' => "Require not ip {$ip}",
                 'csv' => implode(',', [
