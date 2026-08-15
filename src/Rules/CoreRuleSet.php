@@ -85,6 +85,7 @@ class CoreRuleSet
     private static function definitions(): array
     {
         return array_merge(
+            self::protocolEnforcement(),
             self::sqlInjection(),
             self::crossSiteScripting(),
             self::localFileInclusion(),
@@ -98,6 +99,29 @@ class CoreRuleSet
             self::ldapInjection(),
             self::xpathInjection(),
         );
+    }
+
+    /** REQUEST-920: Protocol Enforcement. */
+    protected static function protocolEnforcement(): array
+    {
+        return [
+            [
+                'id' => '920270',
+                'category' => 'protocol',
+                'name' => 'Protocol Violation',
+                'description' => 'Protocol Attack: null byte (%00) in request data',
+                'severity' => 'critical',
+                // The body is deliberately not targeted: raw binary bodies
+                // (protobuf, msgpack, file streams) legitimately contain NULs.
+                // Nothing legitimate carries one in the query, path, headers or
+                // cookies — there it only serves to truncate a string in C-based
+                // layers (e.g. `file=passwd%00.jpg` defeating an extension check).
+                // The normaliser keeps the pre-decoded variant of each surface,
+                // so both the encoded `%00` and a decoded NUL are visible here.
+                'targets' => ['query', 'path', 'headers', 'cookie'],
+                'regex' => '/%00|\x00/',
+            ],
+        ];
     }
 
     /** REQUEST-942: SQL Injection Attacks. */

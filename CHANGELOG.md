@@ -4,6 +4,60 @@ All notable changes to `tuijncode/laravel-waf` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-15
+
+A health-check command, a stronger exclusion-matching rule, and clearer
+diagnostics when findings can't be stored. Minor rather than patch because the
+exclusion-matching change below alters behaviour for hand-inserted rules, and
+because a new detection signature and a new console command widen the surface.
+
+### Added
+
+- **`php artisan waf:doctor`** — one command that checks the WAF is actually
+  *working*, not merely installed. Every check corresponds to a way a WAF fails
+  silently, where the only symptom is an empty log that reads as "no attacks":
+  the WAF is enabled for the current environment; `waf_logs` has every column
+  the writer inserts (a missing one discards **every** finding); the exclusion
+  table exists; the middleware is genuinely wired to a route, group or the
+  global stack; the published `waf.php`/`waf-patterns.php` have not drifted
+  behind this version (a stale published pattern pack silently freezes out every
+  signature shipped since); and the cache driver can support flood counting,
+  bans and dedup. Each finding prints the command or setting that fixes it, and
+  the command exits non-zero only on a real failure, so it drops into CI or a
+  deploy step.
+
+- **`waf:export --format=fail2ban`** emits `fail2ban-client set <jail> banip
+  <ip>` lines, with the jail chosen via `--jail` (default `laravel-waf`). The
+  jail name is restricted to shell-safe characters, since the output is meant to
+  be piped into a shell.
+
+- **Null-byte injection signature (rule 920270).** A `%00` (or a decoded NUL) in
+  the query, path, headers or cookies is flagged as a protocol violation — the
+  classic `file=passwd%00.jpg` extension-check bypass. Request bodies are
+  deliberately exempt, since raw binary bodies legitimately contain NUL bytes.
+
+- **A stale or broken schema now explains itself.** When a finding can't be
+  written — most often because the package was upgraded without its upgrade
+  migration, so `waf_logs` is missing a column — the WAF now logs, once an hour,
+  a message that names the cause and the exact `vendor:publish` + `migrate`
+  commands that fix it, instead of only emitting a raw SQL error per request
+  while the log quietly stays empty.
+
+### Changed
+
+- **Exclusion rules now match the finding label exactly, not by substring.** An
+  exclusion whose `match_label` was `942` previously silenced *every* SQL
+  injection signature, and `SQL` silenced every rule mentioning SQL — an
+  unbounded blast radius on the control whose whole job is switching detections
+  off (and, in blocking mode, switching protection off). A rule now matches only
+  when its label equals the finding's rule id (`942100`), its full description,
+  or the whole `[942100] …` signature. Rules created through the dashboard/log
+  flow (`acceptFromLog`) have always stored the exact rule id and are
+  unaffected; only hand-inserted rows that relied on partial matching change,
+  and they change in the direction of re-enabling detection. The old
+  three-character minimum-length guard is gone, since exact matching makes it
+  unnecessary.
+
 ## [1.2.1] - 2026-07-28
 
 ### Fixed

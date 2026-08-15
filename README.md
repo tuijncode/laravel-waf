@@ -47,6 +47,9 @@ and logs — or blocks — anything that looks like an attack.
 - **Operator tooling** — dry-run a payload (`waf:test`) and export offending IPs as
   a fail2ban / nginx / Apache / CSV blocklist (`waf:export`), alongside stats,
   purge and unban commands.
+- **Health check** — `waf:doctor` verifies the WAF is installed, wired to a route
+  and actually recording, catching the silent failures (stale schema, config
+  drift, unwired middleware) that leave the log deceptively empty.
 - **Config validation** — misconfiguration is surfaced as a log warning at boot.
 - **Queue support** — defer logging off the request cycle.
 - **Retention** — prune old logs manually or on a daily schedule.
@@ -385,6 +388,7 @@ count if you'd rather trade the write.
 ### Console commands
 
 ```bash
+php artisan waf:doctor                # verify the WAF is installed, wired and recording
 php artisan waf:stats --days=7        # summary: counts by category / severity / IP
 php artisan waf:correlate             # surface coordinated / distributed attacks
 php artisan waf:purge --days=90       # delete findings older than N days
@@ -395,6 +399,26 @@ php artisan waf:export --format=nginx # export offending IPs as a blocklist
 
 Set `WAF_RETENTION=true` (and `WAF_RETENTION_DAYS`) to run the purge
 automatically every day at 02:00 via Laravel's scheduler.
+
+#### Health check (`waf:doctor`)
+
+A WAF fails quietly: a log table left behind by an upgrade that never ran its
+migration, a middleware that was never wired to a route, a config published two
+versions ago that freezes out every signature shipped since. In each case the
+log simply stays empty — which looks exactly like "no attacks".
+
+```bash
+php artisan waf:doctor
+```
+
+It checks that the WAF is enabled for this environment, that `waf_logs` has
+every column the writer needs (a missing one discards **every** finding), that
+the exclusion table exists, that the middleware is genuinely applied to a route
+or group, that your published config and pattern pack haven't drifted behind
+this version, and that the cache driver can support flood counting, bans and
+dedup. Each finding prints the command or setting that fixes it, and the command
+exits non-zero only on a real failure — so it drops straight into CI or a deploy
+step.
 
 #### Dry-running a payload (`waf:test`)
 
@@ -419,15 +443,17 @@ spreadsheet:
 ```bash
 php artisan waf:export                                  # plain IP list (stdout)
 php artisan waf:export --format=nginx > /etc/nginx/waf-deny.conf
+php artisan waf:export --format=fail2ban --jail=laravel-waf | sh
 php artisan waf:export --format=csv --min-level=critical --days=7 --min-hits=5
 ```
 
 Offending IPs are grouped and ordered by total hit volume. Filter with
 `--min-level` (severity floor, default `error`), `--days` (recent window),
-`--min-hits` and `--limit`. Formats: `plain` (one IP per line — also suits a
-fail2ban blocklist), `nginx` (`deny <ip>;`), `apache` (`Require not ip <ip>`)
-and `csv`. Data goes to stdout for redirection; the export count and any notices
-go to stderr, keeping the piped output clean.
+`--min-hits` and `--limit`. Formats: `plain` (one IP per line), `fail2ban`
+(`fail2ban-client set <jail> banip <ip>` lines — set the jail with `--jail`),
+`nginx` (`deny <ip>;`), `apache` (`Require not ip <ip>`) and `csv`. Data goes to
+stdout for redirection; the export count and any notices go to stderr, keeping
+the piped output clean.
 
 ### Querying findings
 

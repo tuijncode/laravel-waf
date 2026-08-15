@@ -56,9 +56,9 @@ it('only suppresses on the configured path pattern', function () {
     expect(DB::table('waf_logs')->count())->toBe(1);
 });
 
-it('ignores an exclusion whose label is too short to be safe', function () {
+it('ignores an exclusion whose label is only a partial match', function (string $label) {
     DB::table('waf_exclusion_rules')->insert([
-        'match_label' => '94',   // would otherwise suppress every 94x-family rule
+        'match_label' => $label,
         'path_glob' => null,
         'is_active' => true,
         'created_at' => now(),
@@ -69,6 +69,25 @@ it('ignores an exclusion whose label is too short to be safe', function () {
     $this->get('/?q='.rawurlencode("' UNION SELECT * FROM users--"))->assertOk();
 
     expect(DB::table('waf_logs')->value('action_taken'))->toBe('logged');
+})->with([
+    'family prefix' => '942',            // would suppress every SQLi rule under substring matching
+    'category word' => 'SQL',            // would suppress every rule mentioning SQL
+    'description fragment' => 'UNION SELECT',
+]);
+
+it('accepts an exclusion labelled with the full description', function () {
+    DB::table('waf_exclusion_rules')->insert([
+        'match_label' => 'SQL Injection Attack: UNION SELECT detected',
+        'path_glob' => null,
+        'is_active' => true,
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+    app(ExclusionRuleService::class)->refresh();
+
+    $this->get('/?q='.rawurlencode("' UNION SELECT * FROM users--"))->assertOk();
+
+    expect(DB::table('waf_logs')->value('action_taken'))->toBe('excluded');
 });
 
 it('builds an exclusion rule from a logged threat', function () {

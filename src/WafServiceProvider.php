@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\ServiceProvider;
 use Tuijncode\LaravelWaf\Console\Commands\PurgeWafLogsCommand;
 use Tuijncode\LaravelWaf\Console\Commands\WafCorrelateCommand;
+use Tuijncode\LaravelWaf\Console\Commands\WafDoctorCommand;
 use Tuijncode\LaravelWaf\Console\Commands\WafExportCommand;
 use Tuijncode\LaravelWaf\Console\Commands\WafStatsCommand;
 use Tuijncode\LaravelWaf\Console\Commands\WafTestCommand;
@@ -156,6 +157,7 @@ class WafServiceProvider extends ServiceProvider
                 WafUnbanCommand::class,
                 WafTestCommand::class,
                 WafExportCommand::class,
+                WafDoctorCommand::class,
             ]);
         }
     }

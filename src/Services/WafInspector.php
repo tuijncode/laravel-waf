@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Tuijncode\LaravelWaf\Events\ThreatDetected;
@@ -739,8 +740,55 @@ class WafInspector
             return (int) DB::table(config('waf.table_name', 'waf_logs'))->insertGetId($row);
         } catch (\Throwable $e) {
             Log::error('laravel-waf: could not persist finding', ['error' => $e->getMessage()]);
+            $this->explainPersistFailure(array_keys($row));
 
             return false;
+        }
+    }
+
+    /**
+     * When findings can't be stored, say why in words that name the fix — once
+     * per hour, not once per finding. A stale schema (the package was upgraded
+     * but the upgrade migration never ran) otherwise surfaces only as a raw SQL
+     * error per request while the log table quietly stays empty — which reads
+     * as "no attacks", not "nothing is being recorded".
+     *
+     * @param  array<int, string>  $columns
+     */
+    private function explainPersistFailure(array $columns): void
+    {
+        try {
+            if (! Cache::add('laravel-waf|storage-explained', true, now()->addHour())) {
+                return;
+            }
+
+            $table = (string) config('waf.table_name', 'waf_logs');
+
+            if (! Schema::hasTable($table)) {
+                Log::error(
+                    "laravel-waf: findings are being discarded — the '{$table}' table does not exist. "
+                    .'Run: php artisan vendor:publish --tag=waf-migrations && php artisan migrate. '
+                    .'Then verify with: php artisan waf:doctor'
+                );
+
+                return;
+            }
+
+            $missing = array_values(array_filter(
+                $columns,
+                static fn (string $column): bool => ! Schema::hasColumn($table, $column),
+            ));
+
+            if ($missing !== []) {
+                Log::error(
+                    "laravel-waf: findings are being discarded — '{$table}' is missing the "
+                    .implode(', ', $missing).' column(s); the package was likely upgraded without its '
+                    .'upgrade migration. Run: php artisan vendor:publish --tag=waf-migrations-upgrade '
+                    .'&& php artisan migrate. Then verify with: php artisan waf:doctor'
+                );
+            }
+        } catch (\Throwable) {
+            // Diagnosis is best-effort; the raw error is already logged above.
         }
     }
 

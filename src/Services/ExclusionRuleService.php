@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Schema;
 /**
  * Allow-list for tuning out noise.
  *
- * Operators register signatures they trust (by a substring of the finding
+ * Operators register signatures they trust (by the finding's rule id or full
  * label and, optionally, a path glob). When a later finding matches one of
  * those entries it is flagged as an accepted false positive rather than a live
  * threat. The active set is memoised briefly to spare the database on every
@@ -23,23 +23,33 @@ class ExclusionRuleService
     private const CACHE_BUCKET = 'laravel-waf.exclusions.active';
 
     /**
-     * Labels are matched as substrings, so a very short one (e.g. "94") would
-     * silently suppress whole families of rules. Entries below this length are
-     * ignored.
-     */
-    private const MIN_LABEL_LENGTH = 3;
-
-    /**
      * Decide whether a finding should be treated as an accepted false positive.
+     *
+     * The label must match exactly — the rule id ("942100"), the description
+     * ("SQL Injection Attack: UNION SELECT detected") or the whole signature
+     * ("[942100] SQL Injection Attack: ..."). Substring matching would hand an
+     * exclusion an unbounded blast radius (a label of "942" would silence every
+     * SQLi signature), which is the wrong failure mode for the control whose
+     * whole job is switching detections off — in blocking mode, silently
+     * switching protection off.
      */
     public function accepts(string $signature, string $path): bool
     {
         $path = trim((string) parse_url($path, PHP_URL_PATH), '/');
 
-        return $this->active()->contains(function (object $entry) use ($signature, $path): bool {
-            $label = (string) $entry->match_label;
+        // "[942100] SQL Injection Attack: ..." → id and description handles.
+        $handles = [$signature];
+        if (preg_match('/^\[([^\]]+)\]\s*(.*)$/s', $signature, $parts)) {
+            $handles[] = $parts[1];
+            if ($parts[2] !== '') {
+                $handles[] = $parts[2];
+            }
+        }
 
-            if (mb_strlen($label) < self::MIN_LABEL_LENGTH || ! str_contains($signature, $label)) {
+        return $this->active()->contains(function (object $entry) use ($handles, $path): bool {
+            $label = trim((string) $entry->match_label);
+
+            if ($label === '' || ! in_array($label, $handles, true)) {
                 return false;
             }
 
