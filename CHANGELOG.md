@@ -4,6 +4,13 @@ All notable changes to `tuijncode/laravel-waf` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Requests to `/_ignition/execute-solution` (CVE-2021-3129) now reach decisive
+  confidence and are blocked when the WAF runs globally in blocking mode.
+
 ## [1.3.0] - 2026-08-15
 
 A health-check command, a stronger exclusion-matching rule, and clearer
