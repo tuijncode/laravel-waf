@@ -40,6 +40,17 @@ it('detects a valid credit card number in a POST body', function () {
         ->and($log->type)->toContain('Card Number');
 });
 
+it('blocks an Ignition exploit route in blocking mode without blocking text mentions', function () {
+    config()->set('waf.mode', 'blocking');
+
+    $this->post('/_ignition/execute-solution')->assertForbidden();
+
+    expect(DB::table('waf_logs')->sole()->confidence_score)->toBe(100);
+
+    $this->get('/?x=/_ignition/execute-solution')->assertOk();
+    $this->get('/_ignition/execute-solution-preview')->assertOk();
+});
+
 it('ignores a 16-digit number that fails the Luhn check', function () {
     // Right shape, wrong checksum — an order id, not a card number.
     $this->post('/', ['order' => '4111111111111112'])->assertOk();

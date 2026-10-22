@@ -128,6 +128,7 @@ return [
         // ---------------------------------------------------------------
         // Framework / CVE exploitation attempts
         // ---------------------------------------------------------------
+        '/(?m:^\/_ignition\/execute-solution\/?$)/i' => $d('Laravel Ignition RCE (CVE-2021-3129)', ['path']),
         '/\/_ignition\/execute-solution\b/i' => $c('Laravel Ignition RCE (CVE-2021-3129)', ['query', 'path', 'body']),
         '/eval-stdin\.php\b/i' => $c('PHPUnit RCE (CVE-2017-9841)', ['query', 'path']),
         '/class\.(?:module\.)?classLoader/i' => $c('Spring4Shell (class.classLoader)', ['query', 'body']),
