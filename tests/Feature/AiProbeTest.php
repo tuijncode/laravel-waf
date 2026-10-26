@@ -41,7 +41,7 @@ it('covers additional model and agent configuration probes', function (string $p
 
     $this->get($path)->assertOk();
 
-    expect(DB::table('waf_logs')->value('type'))->toContain($label);
+    expect(str_contains((string) DB::table('waf_logs')->value('type'), $label))->toBeTrue();
 })->with([
     ['/api/show', 'Ollama Model Details'],
     ['/.cursor/rules', 'Agent Rules File Probe'],

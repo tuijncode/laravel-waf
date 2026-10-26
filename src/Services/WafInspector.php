@@ -690,7 +690,10 @@ class WafInspector
             // Laravel's route maps keep the current object under a stable key.
             // Their sizes reveal additions; key lookups reveal replacements.
             $plain = (new \ReflectionProperty(RouteCollection::class, 'allRoutes'))->getValue($routes);
-            $domains = (new \ReflectionProperty(RouteCollection::class, 'allDomainRoutes'))->getValue($routes);
+            // Laravel 10–12 keep domain routes in allRoutes; 13 separates them.
+            $domains = property_exists(RouteCollection::class, 'allDomainRoutes')
+                ? (new \ReflectionProperty(RouteCollection::class, 'allDomainRoutes'))->getValue($routes)
+                : [];
             $count = count($plain) + count($domains);
             if ($this->indexedRouteCollection !== $routes || $this->indexedRouteCount !== $count) {
                 $this->literalRouteKeys = [];

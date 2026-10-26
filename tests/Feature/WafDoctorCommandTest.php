@@ -222,16 +222,16 @@ it('does not warn about attempt retention when scheduled purge is enabled', func
 });
 
 it('warns when the HTTP kernel trusts every proxy', function () {
-    $this->app->make(HttpKernel::class)->prependMiddleware(TrustProxies::class);
-    TrustProxies::at('*');
+    $middleware = new class extends TrustProxies
+    {
+        protected $proxies = '*';
+    };
+    $this->app->instance(get_class($middleware), $middleware);
+    $this->app->make(HttpKernel::class)->prependMiddleware(get_class($middleware));
 
-    try {
-        $this->artisan('waf:doctor')
-            ->expectsOutputToContain('WAF IP decisions may use spoofed X-Forwarded-For')
-            ->assertSuccessful();
-    } finally {
-        TrustProxies::flushState();
-    }
+    $this->artisan('waf:doctor')
+        ->expectsOutputToContain('WAF IP decisions may use spoofed X-Forwarded-For')
+        ->assertSuccessful();
 });
 
 it('warns when proxy trust comes from configuration', function () {

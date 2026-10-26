@@ -26,7 +26,11 @@ it('stores and reads a finding for an authenticated UUID user', function () {
 });
 
 it('widens an existing numeric user ID column without losing values', function () {
-    Schema::table('waf_logs', fn (Blueprint $table) => $table->unsignedBigInteger('user_id')->nullable()->change());
+    Schema::table('waf_logs', function (Blueprint $table): void {
+        $table->dropIndex(['user_id']);
+        $table->dropColumn('user_id');
+    });
+    Schema::table('waf_logs', fn (Blueprint $table) => $table->unsignedBigInteger('user_id')->nullable()->index());
     DB::table('waf_logs')->insert([
         'ip_address' => '203.0.113.1',
         'url' => '/',
@@ -70,7 +74,8 @@ it('stores UUID creators for manual and log-derived exclusions', function () {
 });
 
 it('widens the exclusion creator column without losing numeric IDs', function () {
-    Schema::table('waf_exclusion_rules', fn (Blueprint $table) => $table->unsignedBigInteger('created_by_user_id')->nullable()->change());
+    Schema::table('waf_exclusion_rules', fn (Blueprint $table) => $table->dropColumn('created_by_user_id'));
+    Schema::table('waf_exclusion_rules', fn (Blueprint $table) => $table->unsignedBigInteger('created_by_user_id')->nullable());
     DB::table('waf_exclusion_rules')->insert([
         'match_label' => '942100',
         'created_by_user_id' => 42,

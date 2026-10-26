@@ -296,7 +296,10 @@ class WafDoctorCommand extends Command
     {
         try {
             $kernel = $this->laravel->make(HttpKernel::class);
-            foreach ($kernel->getGlobalMiddleware() as $middleware) {
+            $globalMiddleware = method_exists($kernel, 'getGlobalMiddleware')
+                ? $kernel->getGlobalMiddleware()
+                : (new \ReflectionProperty($kernel, 'middleware'))->getValue($kernel);
+            foreach ($globalMiddleware as $middleware) {
                 if (! is_string($middleware) || ! is_a($middleware, TrustProxies::class, true)) {
                     continue;
                 }

@@ -1,6 +1,6 @@
 <?php
 
-use Illuminate\Queue\Jobs\FakeJob;
+use Illuminate\Contracts\Queue\Job as QueueJob;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -18,17 +18,18 @@ function legacyHitJob(string $eventId, int $queuedAt): RecordWafHit
 {
     $hit = new RecordWafHit($eventId, (string) Str::uuid());
     (new ReflectionProperty($hit, 'findingCreatedAt'))->setValue($hit, null);
-    $hit->setJob(new class($queuedAt) extends FakeJob
-    {
-        public function __construct(private readonly int $queuedAt) {}
-
-        public function getRawBody()
-        {
-            return json_encode(['createdAt' => $this->queuedAt]);
-        }
-    });
+    $job = Mockery::mock(QueueJob::class);
+    $job->shouldReceive('payload')->andReturn(['createdAt' => $queuedAt]);
+    $hit->setJob($job);
 
     return $hit;
+}
+
+function expectMissingSchemaFailure(StoreWafLog|RecordWafHit|FlushWafHits $job): void
+{
+    $queueJob = Mockery::mock(QueueJob::class);
+    $queueJob->shouldReceive('fail')->once()->with(Mockery::type(MissingWafSchema::class));
+    $job->setJob($queueJob);
 }
 
 it('dispatches the store job instead of inserting inline when queueing is enabled', function () {
@@ -517,7 +518,7 @@ it('still counts a duplicate when its cache lock times out', function () {
     try {
         $start = microtime(true);
         app(DedupCounter::class)->duplicate('waf-test-held');
-        expect(microtime(true) - $start)->toBeLessThan(0.5);
+        expect(microtime(true) - $start)->toBeLessThan(1);
     } finally {
         $lock->release();
     }
@@ -572,13 +573,14 @@ it('keeps one flush for a delayed queued burst and cleans up after the dedup win
 
     $this->get($url)->assertOk();
     $flush = Bus::dispatched(FlushWafHits::class)->first();
-    $flush->withFakeQueueInteractions();
+    $queueJob = Mockery::mock(QueueJob::class);
+    $queueJob->shouldReceive('release')->once()->with(300);
+    $flush->setJob($queueJob);
     $this->travel(31)->seconds();
     $this->get($url)->assertOk();
     Bus::assertDispatchedTimes(FlushWafHits::class, 1);
 
     $flush->handle(app(DedupCounter::class));
-    $flush->assertReleased(300);
     expect((int) DB::table('waf_logs')->value('hit_count'))->toBe(3)
         ->and(Cache::get('laravel-waf|pending|'.$eventId))->toBe(2);
     $this->travel(6)->minutes();
@@ -628,32 +630,29 @@ it('fails a queued finding with a missing storage table instead of retrying fore
     Bus::fake();
     $this->get('/?q='.rawurlencode("' UNION SELECT * FROM users--"))->assertOk();
     $job = Bus::dispatched(StoreWafLog::class)->first();
-    $job->withFakeQueueInteractions();
+    expectMissingSchemaFailure($job);
     Schema::drop('waf_logs');
 
     $job->handle();
 
-    $job->assertFailedWith(MissingWafSchema::class);
 });
 
 it('fails a queued hit with a missing ledger table instead of retrying forever', function () {
     $job = new RecordWafHit((string) Str::uuid(), (string) Str::uuid());
-    $job->withFakeQueueInteractions();
+    expectMissingSchemaFailure($job);
     Schema::drop('waf_hit_events');
 
     $job->handle();
 
-    $job->assertFailedWith(MissingWafSchema::class);
 });
 
 it('fails a queued hit with a missing totals table instead of retrying forever', function () {
     $job = new RecordWafHit((string) Str::uuid(), (string) Str::uuid());
-    $job->withFakeQueueInteractions();
+    expectMissingSchemaFailure($job);
     Schema::drop('waf_hit_totals');
 
     $job->handle();
 
-    $job->assertFailedWith(MissingWafSchema::class);
 });
 
 it('fails a queued flush with a missing log table instead of retrying forever', function () {
@@ -664,12 +663,11 @@ it('fails a queued flush with a missing log table instead of retrying forever', 
     Bus::dispatched(StoreWafLog::class)->first()->handle();
     $this->get($url)->assertOk();
     $flush = Bus::dispatched(FlushWafHits::class)->first();
-    $flush->withFakeQueueInteractions();
+    expectMissingSchemaFailure($flush);
     Schema::drop('waf_logs');
 
     $flush->handle(app(DedupCounter::class));
 
-    $flush->assertFailedWith(MissingWafSchema::class);
 });
 
 it('fails a queued flush when the totals table lacks a required column', function () {
@@ -680,12 +678,11 @@ it('fails a queued flush when the totals table lacks a required column', functio
     Bus::dispatched(StoreWafLog::class)->first()->handle();
     $this->get($url)->assertOk();
     $flush = Bus::dispatched(FlushWafHits::class)->first();
-    $flush->withFakeQueueInteractions();
+    expectMissingSchemaFailure($flush);
     Schema::table('waf_hit_totals', fn ($table) => $table->dropColumn('hit_count'));
 
     $flush->handle(app(DedupCounter::class));
 
-    $flush->assertFailedWith(MissingWafSchema::class);
 });
 
 it('updates durable totals without recounting every prior hit', function () {

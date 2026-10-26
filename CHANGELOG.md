@@ -26,6 +26,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Route-aware probes and proxy diagnostics work across Laravel 10–13; Laravel
+  10 installations can run the column-widening migrations with Doctrine DBAL.
 - Direct model pruning now rolls back the cutoff, hit records and exclusion
   links if a deleting observer vetoes or throws; invalid retention ages fail
   before any pruning changes are made.
