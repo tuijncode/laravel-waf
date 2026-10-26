@@ -14,6 +14,7 @@ it('accepts string columns wide enough for user IDs', function (string $type, bo
     ['nvarchar(382)', true],
     ['nvarchar(max)', true],
     ['varchar', true], // SQLite uses an unbounded VARCHAR affinity.
+    ['string', true], // Laravel 10 reports VARCHAR without its length.
     ['text', true],
     ['bigint', false],
     ['char(191)', false],

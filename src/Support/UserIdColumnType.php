@@ -7,6 +7,10 @@ class UserIdColumnType
     public static function acceptsStrings(string $type): bool
     {
         $type = strtolower($type);
+        // shortcut: Laravel 10 reports VARCHAR only as "string"; inspect Doctrine metadata if its column length must be diagnosed.
+        if ($type === 'string') {
+            return true;
+        }
         if (str_contains($type, 'text')) {
             return true;
         }

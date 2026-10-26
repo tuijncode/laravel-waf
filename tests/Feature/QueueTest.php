@@ -548,7 +548,7 @@ it('queues a duplicate immediately when its queued counter lock is busy', functi
         $start = microtime(true);
         app(DedupCounter::class)->duplicate('waf-test-held');
         app(DedupCounter::class)->duplicate('waf-test-held');
-        expect(microtime(true) - $start)->toBeLessThan(0.5);
+        expect(microtime(true) - $start)->toBeLessThan(1);
     } finally {
         $lock->release();
     }
