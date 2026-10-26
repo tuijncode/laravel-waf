@@ -345,6 +345,11 @@ A larger, ready-made **signature pack** ships separately in
 - **SSTI / XSS / SQLi variants**, CRLF header injection, open redirect,
   GraphQL introspection, web shells, reverse shells and crypto miners.
 
+The Ignition `/_ignition/execute-solution` route is blocked in blocking mode when
+the WAF middleware runs globally. Probes served directly by the web server or
+handled before Laravel starts (including an exposed PHPUnit file) never reach
+this middleware; patch the affected software and restrict them at the server.
+
 Credential signatures are scoped to the URL / query string (not request bodies),
 so normal login POSTs and `Authorization: Bearer …` headers don't trip them.
 Publish the file to customise, or turn the pack off entirely with
