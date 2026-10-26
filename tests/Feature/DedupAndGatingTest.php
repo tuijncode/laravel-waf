@@ -1,8 +1,11 @@
 <?php
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schema;
+use Tuijncode\LaravelWaf\Events\RequestBlocked;
 use Tuijncode\LaravelWaf\Services\CorrelationAnalyzer;
+use Tuijncode\LaravelWaf\Services\ExclusionRuleService;
 
 it('logs a repeated identical threat only once within the dedup window', function () {
     $q = '/?q='.rawurlencode("' UNION SELECT * FROM users--");
@@ -15,7 +18,6 @@ it('logs a repeated identical threat only once within the dedup window', functio
 });
 
 it('bumps the hit counter on a deduplicated finding instead of dropping it', function () {
-    config()->set('waf.dedup_flush_seconds', 0); // write every bump through, exact
     $q = '/?q='.rawurlencode("' UNION SELECT * FROM users--");
 
     $this->get($q)->assertOk();
@@ -27,7 +29,6 @@ it('bumps the hit counter on a deduplicated finding instead of dropping it', fun
 });
 
 it('surfaces a single-attack flood as a rapid attacker via hit_count', function () {
-    config()->set('waf.dedup_flush_seconds', 0);
     $q = '/?q='.rawurlencode("' UNION SELECT * FROM users--");
 
     // 12 identical hits collapse to one row (hit_count 12). Counting rows would
@@ -45,23 +46,19 @@ it('surfaces a single-attack flood as a rapid attacker via hit_count', function 
         ->and((int) $found[0]['hits'])->toBe(12);
 });
 
-it('coalesces hit_count writes when a flush interval is set', function () {
-    config()->set('waf.dedup_flush_seconds', 300); // effectively one flush per burst
+it('keeps the last duplicate when a burst stops', function () {
     $q = '/?q='.rawurlencode("' UNION SELECT * FROM users--");
 
     for ($i = 0; $i < 12; $i++) {
         $this->get($q)->assertOk();
     }
 
-    // Still one row, but the counter isn't written per request: the bumps are
-    // held in the cache and only partially flushed, so the stored count trails
-    // the true volume (eventually consistent) rather than costing 11 UPDATEs.
+    $this->travel(10)->minutes();
     $log = DB::table('waf_logs')->sole();
-    expect((int) $log->hit_count)->toBeLessThan(12)
-        ->and((int) $log->hit_count)->toBeGreaterThanOrEqual(1);
+    expect((int) $log->hit_count)->toBe(12);
 });
 
-it('does not tally duplicates under queueing (hit_count stays 1)', function () {
+it('tallies duplicates under queueing', function () {
     config()->set('queue.default', 'sync');
     config()->set('waf.queue.enabled', true);
 
@@ -70,10 +67,8 @@ it('does not tally duplicates under queueing (hit_count stays 1)', function () {
     $this->get($q)->assertOk();
     $this->get($q)->assertOk();
 
-    // The row id isn't known synchronously under queueing, so later duplicates
-    // aren't counted — one row, hit_count 1.
     $log = DB::table('waf_logs')->sole();
-    expect((int) $log->hit_count)->toBe(1);
+    expect((int) $log->hit_count)->toBe(3);
 });
 
 it('releases the dedup slot when the log write fails, so the finding is not lost', function () {
@@ -98,6 +93,35 @@ it('logs distinct threats separately', function () {
     $this->get('/?q='.rawurlencode('<script>alert(1)</script>'))->assertOk();
 
     expect(DB::table('waf_logs')->count())->toBe(2);
+});
+
+it('does not collapse a new blocked rule set into an excluded finding', function () {
+    config()->set('waf.mode', 'blocking');
+    config()->set('waf.block_confidence', 0);
+    DB::table('waf_exclusion_rules')->insert([
+        'match_label' => '942100', 'path_glob' => null, 'is_active' => true,
+        'created_at' => now(), 'updated_at' => now(),
+    ]);
+    app(ExclusionRuleService::class)->refresh();
+
+    $this->get('/?q='.rawurlencode('UNION ALL SELECT 1'))->assertOk();
+    $this->get('/?q='.rawurlencode('UNION ALL SELECT 1').'&x='.rawurlencode('<script>alert(1)</script>'))
+        ->assertForbidden();
+
+    expect(DB::table('waf_logs')->pluck('action_taken')->all())->toBe(['excluded', 'blocked']);
+});
+
+it('announces separate blocks when an extra rule joins the same primary finding', function () {
+    config()->set('waf.mode', 'blocking');
+    config()->set('waf.block_confidence', 0);
+    Event::fake([RequestBlocked::class]);
+
+    $this->get('/?q='.rawurlencode('UNION ALL SELECT 1'))->assertForbidden();
+    $this->get('/?q='.rawurlencode('UNION ALL SELECT 1').'&x='.rawurlencode('<script>alert(1)</script>'))
+        ->assertForbidden();
+
+    expect(DB::table('waf_logs')->count())->toBe(2);
+    Event::assertDispatchedTimes(RequestBlocked::class, 2);
 });
 
 it('collapses the same attack across paths by default', function () {

@@ -15,6 +15,9 @@ it('explains a missing log table instead of only logging a raw SQL error', funct
         ->withArgs(fn (string $message): bool => str_contains($message, 'findings are being discarded')
             && str_contains($message, 'waf:doctor'))
         ->once();
+    Log::shouldHaveReceived('warning')
+        ->withArgs(fn (string $message): bool => $message === 'laravel-waf finding detected')
+        ->once();
 });
 
 it('explains a missing write column (a stale, un-upgraded schema)', function () {

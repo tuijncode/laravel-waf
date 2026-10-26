@@ -38,6 +38,10 @@ class Validators
      */
     private static function luhn(string $value): bool
     {
+        if (strlen($value) < 12) {
+            return false;
+        }
+
         $digits = (string) preg_replace('/\D/', '', $value);
 
         if (strlen($digits) < 12) {

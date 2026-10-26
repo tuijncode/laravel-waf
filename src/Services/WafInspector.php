@@ -3,11 +3,14 @@
 namespace Tuijncode\LaravelWaf\Services;
 
 use Illuminate\Http\Request;
+use Illuminate\Routing\CompiledRouteCollection;
+use Illuminate\Routing\Route as LaravelRoute;
+use Illuminate\Routing\RouteCollection;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
@@ -16,6 +19,13 @@ use Tuijncode\LaravelWaf\Jobs\StoreWafLog;
 use Tuijncode\LaravelWaf\Rules\CoreRuleSet;
 use Tuijncode\LaravelWaf\Rules\Signature;
 use Tuijncode\LaravelWaf\Rules\SignatureMatch;
+use Tuijncode\LaravelWaf\Support\CacheFailure;
+use Tuijncode\LaravelWaf\Support\ClientIp;
+use Tuijncode\LaravelWaf\Support\DedupCounter;
+use Tuijncode\LaravelWaf\Support\QuietEvent;
+use Tuijncode\LaravelWaf\Support\QuietLog;
+use Tuijncode\LaravelWaf\Support\SurfaceDecoder;
+use Tuijncode\LaravelWaf\Support\TargetHash;
 
 /**
  * Request inspection engine.
@@ -27,11 +37,34 @@ use Tuijncode\LaravelWaf\Rules\SignatureMatch;
  */
 class WafInspector
 {
-    /** Hard cap on bytes examined per surface, so a huge payload can't stall a regex. */
-    private const SURFACE_LIMIT = 16000;
+    /** Bound regex work per subject while inspecting every part of large inputs. */
+    private const SURFACE_CHUNK = 16384;
 
-    /** Bytes kept from the end of an oversized surface, so padding can't push an attack out of view. */
-    private const SURFACE_TAIL = 4000;
+    // shortcut: matches spanning over 16 KiB of raw input can be missed; raise the window or use a streaming detector if longer matches are required.
+    private const SURFACE_OVERLAP = 8192;
+
+    /** PCRE failures already reported by this worker. */
+    private static array $regexFailures = [];
+
+    private static bool $queueFailureWarned = false;
+
+    private ?object $indexedRouteCollection = null;
+
+    private int $indexedRouteCount = -1;
+
+    private ?RouteCollection $lateRoutes = null;
+
+    /** @var array<string, array<int, LaravelRoute>> */
+    private array $literalRoutes = [];
+
+    /** @var array<string, array<int, LaravelRoute>> */
+    private array $dynamicRoutes = [];
+
+    /** @var array<string, array<int, array{string, bool}>> */
+    private array $literalRouteKeys = [];
+
+    /** @var array<string, array<int, array{string, bool}>> */
+    private array $dynamicRouteKeys = [];
 
     private const SEVERITIES = ['critical', 'error', 'warning', 'notice'];
 
@@ -42,6 +75,7 @@ class WafInspector
         private ?DdosMonitor $flood = null,
         private ?ExclusionRuleService $exclusions = null,
         private ?Redactor $redactor = null,
+        private ?AttemptRecorder $attempts = null,
     ) {
         $this->scorer ??= new ConfidenceScorer;
         $this->scanners ??= new ScannerDetector;
@@ -49,6 +83,18 @@ class WafInspector
         $this->flood ??= new DdosMonitor;
         $this->exclusions ??= new ExclusionRuleService;
         $this->redactor ??= new Redactor;
+        $this->attempts ??= new AttemptRecorder;
+    }
+
+    /** Call after changing a registered route's URI in place. */
+    public function refreshRouteIndex(LaravelRoute $route): void
+    {
+        (new \ReflectionProperty(LaravelRoute::class, 'compiled'))->setValue($route, null);
+        $this->indexedRouteCollection = null;
+        $this->indexedRouteCount = -1;
+        $this->lateRoutes = null;
+        $this->literalRoutes = $this->dynamicRoutes = [];
+        $this->literalRouteKeys = $this->dynamicRouteKeys = [];
     }
 
     /**
@@ -57,16 +103,22 @@ class WafInspector
      */
     public function inspect(Request $request): InspectionResult
     {
-        $surfaces = $this->collectSurfaces($request);
-        $hits = $this->scan($surfaces);
+        $hits = $this->scan($this->collectSurfaces($request));
+        if ($probe = $this->pathProbe($request, 'ai_probes', 'AI-PROBE', 'ai_probe', 'AI Infrastructure Probe')) {
+            $hits[] = $probe;
+        }
+        if ($probe = $this->pathProbe($request, 'probe_paths', 'PATH-PROBE', 'probe', 'Unserved Path Probe')) {
+            $hits[] = $probe;
+        }
 
         $agent = (string) ($request->userAgent() ?? '');
-        $scanner = $this->scanners->detect($agent);
+        $scanner = $this->signalEnabled('913100', 'scanner') ? $this->scanners->detect($agent) : null;
         // A whitelisted agent (e.g. a known uptime monitor) is exempt from bot
         // detection, so a legitimate curl health check isn't logged every window.
-        $bot = ($scanner || $this->isWhitelistedAgent($agent)) ? null : $this->bots->detect($agent);
-        $flooding = config('waf.ddos.enabled', true)
-            && $this->flood->tripped((string) $request->ip());
+        $bot = ($scanner || ! $this->signalEnabled('913110', 'bot') || $this->isWhitelistedAgent($agent))
+            ? null : $this->bots->detect($agent);
+        $flooding = config('waf.ddos.enabled', true) && $this->signalEnabled('912100', 'ddos')
+            && $this->flood->tripped(ClientIp::from($request));
 
         if ($scanner !== null) {
             $hits[] = new SignatureMatch(
@@ -111,6 +163,12 @@ class WafInspector
         return false;
     }
 
+    private function signalEnabled(string $ruleId, string $category): bool
+    {
+        return ! in_array($ruleId, (array) config('waf.disabled_rules', []), true)
+            && ! in_array($category, (array) config('waf.disabled_categories', []), true);
+    }
+
     /**
      * Evaluate a request and, when warranted, record the finding + fire the event.
      * Returns the finding only when it is actionable (i.e. not an accepted
@@ -120,11 +178,27 @@ class WafInspector
     {
         // Count the request towards the client's flood budget before the
         // read-only inspection checks it.
-        if (config('waf.ddos.enabled', true)) {
-            $this->flood->hit((string) $request->ip());
+        if (config('waf.ddos.enabled', true) && $this->signalEnabled('912100', 'ddos')) {
+            $ip = ClientIp::from($request);
+            $this->flood->hit($ip);
+
+            if (config('waf.mode', 'detection') === 'blocking' && config('waf.ddos.block', false) && $this->flood->tripped($ip)) {
+                $flood = new InspectionResult(
+                    isDdos: true,
+                    confidence: $this->scorer->calculate([], false, false, true),
+                );
+                if ($this->wouldBlock($request, $flood)) {
+                    // shortcut: early flood blocks omit other signatures and attempt fingerprints; add sampled inspection if that evidence is required.
+                    $this->record($request, $flood, false, true);
+
+                    return $flood;
+                }
+            }
         }
 
         $result = $this->inspect($request);
+
+        $this->attempts->record($request, $result->matches);
 
         if (! $result->isThreat() || $result->confidenceScore() < (int) config('waf.min_confidence', 10)) {
             return null;
@@ -132,7 +206,7 @@ class WafInspector
 
         // Accepted false positives are still recorded for the audit trail, but
         // withheld from the caller so they never trigger a block.
-        $accepted = $this->exclusions->accepts($result->summary(), $request->fullUrl());
+        $accepted = $this->accepted($request, $result);
 
         $this->record($request, $result, $accepted);
 
@@ -160,17 +234,30 @@ class WafInspector
         return $result->confidenceScore() >= (int) config('waf.block_confidence', 60);
     }
 
+    public function wouldBlock(Request $request, InspectionResult $result): bool
+    {
+        return $result->isThreat()
+            && $result->confidenceScore() >= (int) config('waf.min_confidence', 10)
+            && $this->shouldBlock($result)
+            && ! $this->accepted($request, $result);
+    }
+
+    private function accepted(Request $request, InspectionResult $result): bool
+    {
+        return $this->exclusions->acceptsAll($result->signatures(), $this->requestUrl($request));
+    }
+
     /**
      * Slice the request into the named surfaces the signatures target.
      *
-     * @return array<string, string>
+     * @return array<string, iterable<string>>
      */
     private function collectSurfaces(Request $request): array
     {
         return [
             'query' => $this->querySurface($request),
             'body' => $this->bodySurface($request),
-            'path' => $this->normalise(rawurldecode($request->getPathInfo())),
+            'path' => [rawurldecode($request->getPathInfo())],
             'headers' => $this->headerSurface($request),
             'cookie' => $this->stringify($request->cookies->all()),
         ];
@@ -182,51 +269,74 @@ class WafInspector
      * nested keys work). A leading "?" is prepended so the very first parameter
      * is anchored the same way as the rest.
      */
-    private function querySurface(Request $request): string
+    private function querySurface(Request $request): array
     {
         $parts = [];
 
-        // When safe fields are configured, the raw query string is skipped (it
-        // would reintroduce a safe field's value); the filtered parsed params
-        // are scanned instead. A query with no params has nothing to protect.
-        $raw = $request->getQueryString();
-        if ($raw !== null && $raw !== '' && ! ($this->hasSafeFields() && $request->query->all() !== [])) {
-            $parts[] = $this->normalise('?'.rawurldecode($raw));
+        // getQueryString() has already collapsed duplicate keys; keep the URI's
+        // original pairs and filter safe fields one pair at a time.
+        $raw = (string) parse_url($request->getRequestUri(), PHP_URL_QUERY);
+        if ($raw !== '' && $this->hasSafeFields()) {
+            $pairs = explode('&', $raw);
+            $marked = [];
+            foreach ($pairs as $index => $pair) {
+                $marked[] = explode('=', $pair, 2)[0].'=waf_pair_'.$index;
+            }
+            // Parsing all keys together preserves the indexes assigned to [] fields.
+            @parse_str(implode('&', $marked), $fields);
+            $present = array_fill_keys(Arr::flatten($fields), true);
+            $visible = array_fill_keys(Arr::flatten($this->withoutSafeFields($fields)), true);
+            $kept = [];
+            foreach ($pairs as $index => $pair) {
+                $marker = 'waf_pair_'.$index;
+                if (isset($present[$marker])) {
+                    if (isset($visible[$marker])) {
+                        $kept[] = $pair;
+                    }
+                } else {
+                    // A later scalar duplicate overwrote this pair during parsing.
+                    parse_str($pair, $field);
+                    if ($field === [] || $this->withoutSafeFields($field) !== []) {
+                        $kept[] = $pair;
+                    }
+                }
+            }
+            $raw = implode('&', $kept);
+        }
+        if ($raw !== '') {
+            $parts[] = '?'.rawurldecode($raw);
         }
 
         $params = $this->withoutSafeFields($request->query->all());
         if ($params !== []) {
-            $parts[] = $this->stringify($params);
+            if ($this->hasSafeFields()) {
+                $parts[] = '?'.rawurldecode(http_build_query($params, '', '&', PHP_QUERY_RFC3986));
+            }
+            array_push($parts, ...$this->stringify($params));
         }
 
-        return implode("\n", $parts);
+        return $parts;
     }
 
     /**
-     * The body as its parsed fields (uploaded binaries removed), the client
-     * names of any uploaded files, and its raw content — covering form-encoded,
-     * JSON, XML and multipart payloads alike.
+     * The body as its parsed fields, uploaded file names, and raw content for
+     * unstructured, form-encoded and JSON requests.
      */
-    private function bodySurface(Request $request): string
+    private function bodySurface(Request $request): \Generator
     {
-        $parts = [];
-
         // On JSON requests this bag holds the parsed JSON fields (Laravel
         // swaps in the JSON input source), with \uXXXX escapes decoded —
         // RequestSurfaceTest pins that, since the raw content alone would
         // let an escape-encoded payload slip past every signature.
-        $bag = $request->request->all();
+        $bag = $request->isJson() ? $request->json()->all() : $request->request->all();
         $fields = $this->withoutSafeFields($bag);
-        foreach (array_keys($request->allFiles()) as $fileField) {
-            unset($fields[$fileField]);
-        }
-        if ($fields !== []) {
-            $parts[] = $this->stringify($fields);
-        }
+        // Laravel keeps uploads in the separate files bag; form fields sharing
+        // a parent name with an upload still need inspection.
+        yield from $this->structuredBody($fields);
 
         $names = $this->uploadedFileNames($request);
         if ($names !== []) {
-            $parts[] = $this->normalise(implode("\n", $names));
+            yield implode("\n", $names);
         }
 
         // The raw body is skipped when safe fields are configured and the body
@@ -234,11 +344,51 @@ class WafInspector
         // back in through the raw content. Unstructured bodies (raw XML/text,
         // which have no named fields to protect) are still scanned raw.
         $raw = (string) $request->getContent();
-        if ($raw !== '' && ! ($this->hasSafeFields() && $bag !== [])) {
-            $parts[] = $this->normalise($raw);
+        $multipartUpload = $request->allFiles() !== []
+            && str_starts_with(strtolower((string) $request->headers->get('content-type')), 'multipart/form-data');
+        if ($raw !== '' && ! $multipartUpload && ! ($this->hasSafeFields() && $bag !== [])) {
+            yield $raw;
+        }
+    }
+
+    /** @param array<string, mixed> $fields */
+    private function structuredBody(array $fields): \Generator
+    {
+        $batch = [];
+        $bytes = 0;
+        foreach (Arr::dot($fields) as $path => $value) {
+            if (is_array($value)) {
+                yield (string) $path;
+
+                continue;
+            }
+
+            $size = strlen((string) $path) + strlen((string) $value);
+            if ($batch !== [] && $bytes + $size > 65536) {
+                yield '?'.rawurldecode(http_build_query($batch, '', '&', PHP_QUERY_RFC3986));
+                yield from $this->stringify($batch);
+                $batch = [];
+                $bytes = 0;
+            }
+
+            if ($size > 65536) {
+                $field = [];
+                Arr::set($field, (string) $path, substr((string) $value, 0, self::SURFACE_CHUNK));
+                yield '?'.rawurldecode(http_build_query($field, '', '&', PHP_QUERY_RFC3986));
+                yield from $this->stringify($field);
+                yield (string) $value;
+
+                continue;
+            }
+
+            Arr::set($batch, (string) $path, $value);
+            $bytes += $size;
         }
 
-        return implode("\n", $parts);
+        if ($batch !== []) {
+            yield '?'.rawurldecode(http_build_query($batch, '', '&', PHP_QUERY_RFC3986));
+            yield from $this->stringify($batch);
+        }
     }
 
     /**
@@ -312,36 +462,34 @@ class WafInspector
      * Header values worth inspecting, dropping transport plumbing and the
      * cookie header (cookies are inspected on their own surface).
      */
-    private function headerSurface(Request $request): string
+    private function headerSurface(Request $request): array
     {
-        $ignore = ['host', 'cookie', 'content-length', 'accept-encoding', 'accept-language', 'connection'];
+        $ignore = ['cookie'];
 
         $pairs = [];
         foreach ($request->headers->all() as $name => $values) {
             if (in_array($name, $ignore, true)) {
                 continue;
             }
-            $pairs[$name] = implode(' ', array_slice((array) $values, 0, 2));
+            $pairs[$name] = implode(' ', (array) $values);
         }
 
-        return $pairs === [] ? '' : $this->stringify($pairs);
+        return $this->stringify($pairs);
     }
 
-    private function stringify(array $data): string
+    private function stringify(array $data): array
     {
         // Without the substitute flag, one invalid UTF-8 byte in any field makes
         // json_encode return false and the whole parsed surface vanishes — on a
         // multipart request (no raw body available) that would blind the WAF to
         // the entire body.
-        return $data === [] ? '' : $this->normalise(
-            (string) json_encode($data, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE)
-        );
+        return $data === [] ? [] : [(string) json_encode($data, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE)];
     }
 
     /**
-     * Trim to the byte cap, then expose the payload alongside a series of
-     * decoded views so evasion via encoding can't hide a signature. Each
-     * transform is only appended when it actually changes the string:
+     * Inspect overlapping chunks, exposing each alongside decoded views
+     * so one encoding layer cannot hide another. Repeat at most three times;
+     * each transform is appended only when it changes the string:
      *
      *   1. percent-decoding (twice, to unwrap double URL-encoding)
      *   2. HTML-entity decoding (e.g. `&lt;script&gt;` → `<script>`)
@@ -351,162 +499,360 @@ class WafInspector
      *   6. SQL-comment stripping (an inline block comment between UNION and
      *      SELECT is folded to a space, so the pair reads as `UNION SELECT`)
      */
-    private function normalise(string $raw): string
+    private function normalise(string $raw): \Generator
     {
-        // Oversized payloads are sampled head + tail rather than hard-truncated,
-        // so prepending junk can't push an attack past the inspected window.
-        if (strlen($raw) > self::SURFACE_LIMIT) {
-            $raw = substr($raw, 0, self::SURFACE_LIMIT)."\n".substr($raw, -self::SURFACE_TAIL);
+        for ($offset = 0, $length = strlen($raw); $offset < $length; $offset += self::SURFACE_CHUNK) {
+            $start = max(0, $offset - self::SURFACE_OVERLAP);
+            yield from SurfaceDecoder::variants(substr($raw, $start, self::SURFACE_CHUNK + 2 * self::SURFACE_OVERLAP));
         }
-
-        $variants = [$raw];
-
-        $url = rawurldecode(rawurldecode($raw));
-        if ($url !== $raw) {
-            $variants[] = $url;
-        }
-
-        $html = html_entity_decode($url, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        if ($html !== $url) {
-            $variants[] = $html;
-        }
-
-        $unicode = $this->decodeIisUnicode($html);
-        if ($unicode !== $html) {
-            $variants[] = $unicode;
-        }
-
-        $escaped = $this->decodeBackslashEscapes($unicode);
-        if ($escaped !== $unicode) {
-            $variants[] = $escaped;
-        }
-
-        $denulled = str_replace("\0", '', $escaped);
-        if ($denulled !== $escaped) {
-            $variants[] = $denulled;
-        }
-
-        $decommented = $this->stripSqlComments($denulled);
-        if ($decommented !== $denulled) {
-            $variants[] = $decommented;
-        }
-
-        return implode("\n", array_unique($variants));
-    }
-
-    /**
-     * Produce a view with SQL comments folded away, so inline-comment evasion
-     * (a block comment wedged between UNION and SELECT, or a MySQL executable
-     * comment) reads as ordinary SQL and trips the keyword rules even at
-     * paranoia level 1 — where the broad comment-sequence rule (942170) is off.
-     *
-     * The comment bodies are length-bounded so a comment-open flood stays linear.
-     */
-    private function stripSqlComments(string $value): string
-    {
-        if (! str_contains($value, '/*') && ! str_contains($value, '--') && ! str_contains($value, '#')) {
-            return $value;
-        }
-
-        // MySQL executable comments run their contents, so keep the inner SQL
-        // and drop only the wrapper: `/*!50000UNION*/` becomes ` UNION `.
-        $value = (string) preg_replace('#/\*!(?:\d{5})?(.{0,2000}?)\*/#s', ' $1 ', $value);
-
-        // An ordinary block comment is a token separator: collapse it to a
-        // single space so `UNION/**/SELECT` reads as `UNION SELECT`.
-        $value = (string) preg_replace('#/\*.{0,2000}?\*/#s', ' ', $value);
-
-        // Line comments (`-- `, `#`) run to the end of the line.
-        $value = (string) preg_replace('/(?:--\s|\#)[^\n]*/', ' ', $value);
-
-        return $value;
-    }
-
-    /**
-     * Decode Microsoft IIS `%uXXXX` escapes (e.g. `%u003c` → `<`), a classic
-     * WAF-evasion encoding that ordinary percent-decoding leaves untouched.
-     * The callback is linear over a capped surface, so it can't go quadratic.
-     */
-    private function decodeIisUnicode(string $value): string
-    {
-        if (stripos($value, '%u') === false) {
-            return $value;
-        }
-
-        return (string) preg_replace_callback(
-            '/%u([0-9a-fA-F]{4})/',
-            static fn (array $m): string => (string) mb_convert_encoding(
-                pack('n', (int) hexdec($m[1])), 'UTF-8', 'UTF-16BE'
-            ),
-            $value,
-        );
-    }
-
-    /**
-     * Decode JS/JSON-style backslash escapes — `\uXXXX` and `\xXX` — so a
-     * payload hidden as `<script>` is unmasked. Ordinary percent- and
-     * entity-decoding leaves these untouched. Linear over a capped surface.
-     */
-    private function decodeBackslashEscapes(string $value): string
-    {
-        if (! str_contains($value, '\\')) {
-            return $value;
-        }
-
-        $value = (string) preg_replace_callback(
-            '/\\\\u([0-9a-fA-F]{4})/',
-            static fn (array $m): string => (string) mb_convert_encoding(
-                pack('n', (int) hexdec($m[1])), 'UTF-8', 'UTF-16BE'
-            ),
-            $value,
-        );
-
-        return (string) preg_replace_callback(
-            '/\\\\x([0-9a-fA-F]{2})/',
-            static fn (array $m): string => chr((int) hexdec($m[1])),
-            $value,
-        );
     }
 
     /**
      * Test every signature against the surfaces it targets, keeping the first
      * hit per signature.
      *
-     * @param  array<string, string>  $surfaces
+     * @param  array<string, iterable<string>>  $surfaces
      * @return array<int, SignatureMatch>
      */
     private function scan(array $surfaces): array
     {
         $hits = [];
+        $hitPriorities = [];
 
         $level = (int) config('waf.paranoia_level', 2);
         $mutedRules = (array) config('waf.disabled_rules', []);
         $mutedCategories = (array) config('waf.disabled_categories', []);
 
-        foreach (array_merge(CoreRuleSet::rules(), $this->extraSignatures()) as $signature) {
+        $bySurface = [];
+        foreach (array_merge(CoreRuleSet::rules(), $this->extraSignatures(), $this->llmSignatures()) as $index => $signature) {
             if (in_array($signature->id, $mutedRules, true)
                 || in_array($signature->category, $mutedCategories, true)
                 || ! $signature->firesAtParanoia($level)) {
                 continue;
             }
 
-            foreach ($signature->targets as $surface) {
-                $subject = $surfaces[$surface] ?? '';
+            foreach ($signature->targets as $priority => $surface) {
+                $bySurface[$surface][$index] = [$signature, $priority];
+            }
+        }
 
-                if ($subject === '') {
-                    continue;
+        $operatorPatterns = (array) config('waf.custom_patterns', []);
+        foreach ($surfaces as $surface => $parts) {
+            foreach ($parts as $raw) {
+                foreach ($this->normalise($raw) as $subject) {
+                    foreach ($bySurface[$surface] ?? [] as $index => [$signature, $priority]) {
+                        if (isset($hitPriorities[$index]) && $priority >= $hitPriorities[$index]) {
+                            continue;
+                        }
+
+                        $hit = $this->matchSignature($signature, $subject, $surface);
+
+                        if ($hit !== null) {
+                            $hits[$index] = $hit;
+                            $hitPriorities[$index] = $priority;
+                            if ($priority === 0) {
+                                foreach ($signature->targets as $target) {
+                                    unset($bySurface[$target][$index]);
+                                }
+                            }
+                        }
+                    }
                 }
 
-                $matched = $signature->match($subject);
-                if ($matched !== null) {
-                    $hits[] = $signature->hit($surface, $matched);
+                if ($operatorPatterns !== [] && strlen($raw) > self::SURFACE_CHUNK + 2 * self::SURFACE_OVERLAP) {
+                    // shortcut: full decoding is limited to 1 MiB to bound temporary memory; use a streaming matcher for larger encoded spans.
+                    $decoded = strlen($raw) <= 1048576 ? rawurldecode(rawurldecode($raw)) : $raw;
+                    foreach ($bySurface[$surface] ?? [] as $index => [$signature, $priority]) {
+                        if (! str_starts_with($signature->id, 'CUSTOM-')
+                            || ! array_key_exists($signature->regex, $operatorPatterns)
+                            || $signature->validator !== null
+                            || (isset($hitPriorities[$index]) && $priority >= $hitPriorities[$index])) {
+                            continue;
+                        }
 
-                    break;
+                        $hit = $this->matchSignature($signature, $raw, $surface);
+                        if ($hit === null && $decoded !== $raw) {
+                            $hit = $this->matchSignature($signature, $decoded, $surface);
+                        }
+                        if ($hit !== null) {
+                            $hits[$index] = $hit;
+                            $hitPriorities[$index] = $priority;
+                            if ($priority === 0) {
+                                foreach ($signature->targets as $target) {
+                                    unset($bySurface[$target][$index]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                foreach ($bySurface[$surface] ?? [] as $index => [$signature, $priority]) {
+                    if (! $signature->streamingMkfifo
+                        || (isset($hitPriorities[$index]) && $priority >= $hitPriorities[$index])
+                        || ! $this->hasLongMkfifoPipe($raw)) {
+                        continue;
+                    }
+
+                    $hits[$index] = $signature->hit($surface, 'mkfifo ... |');
+                    $hitPriorities[$index] = $priority;
+                    if ($priority === 0) {
+                        foreach ($signature->targets as $target) {
+                            unset($bySurface[$target][$index]);
+                        }
+                    }
                 }
             }
         }
 
-        return $hits;
+        ksort($hits);
+
+        return array_values($hits);
+    }
+
+    private function matchSignature(Signature $signature, string $subject, string $surface): ?SignatureMatch
+    {
+        try {
+            $matched = $signature->match($subject);
+
+            return $matched === null ? null : $signature->hit($surface, $matched);
+        } catch (\RuntimeException $e) {
+            if (config('waf.on_error', 'open') === 'closed') {
+                throw $e;
+            }
+
+            $rule = $signature->id.'|'.$signature->regex;
+            if (! isset(self::$regexFailures[$rule])) {
+                self::$regexFailures[$rule] = true;
+                QuietLog::write('warning', 'laravel-waf: signature evaluation error', [
+                    'rule_id' => $signature->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            return null;
+        }
+    }
+
+    private function hasLongMkfifoPipe(string $raw): bool
+    {
+        if (! preg_match('/(?:^|[=;&|\r\n\x22\x27])[ \t]{0,32}mkfifo\b[ \t]+[^\s;|]+[ \t]*;[ \t]*cat\b[ \t]+[^\s|]+/im', $raw, $marker, PREG_OFFSET_CAPTURE)) {
+            return false;
+        }
+
+        return preg_match('/\|[ \t]*(?:\/(?:usr\/)?bin\/)?(?:ba)?sh\b/i', $raw, offset: $marker[0][1] + strlen($marker[0][0])) === 1;
+    }
+
+    /** Flag a configured probe only when the application does not serve its path. */
+    private function pathProbe(Request $request, string $group, string $ruleId, string $category, string $name): ?SignatureMatch
+    {
+        if (! config("waf.{$group}.enabled", false)) {
+            return null;
+        }
+
+        $path = rawurldecode($request->getPathInfo());
+        foreach ((array) config("waf.{$group}.paths", []) as $pattern => $label) {
+            if (! fnmatch(strtolower((string) $pattern), strtolower($path), FNM_PATHNAME)) {
+                continue;
+            }
+
+            if (in_array($ruleId, (array) config('waf.disabled_rules', []), true)
+                || in_array($category, (array) config('waf.disabled_categories', []), true)
+                || $this->applicationServes($request)) {
+                return null;
+            }
+
+            return new SignatureMatch(
+                id: $ruleId,
+                category: $category,
+                name: $name,
+                description: (string) $label,
+                severity: 'warning',
+                context: 'path',
+                matched: $path,
+            );
+        }
+
+        return null;
+    }
+
+    private function applicationServes(Request $request): bool
+    {
+        $routes = Route::getRoutes();
+        $matched = $request->route();
+        if ($matched instanceof LaravelRoute && $this->servesProbe($matched, $request)) {
+            return true;
+        }
+
+        $path = trim($request->decodedPath(), '/');
+        $segment = explode('/', $path, 2)[0];
+
+        if ($routes instanceof RouteCollection && get_class($routes) === RouteCollection::class) {
+            // Laravel's route maps keep the current object under a stable key.
+            // Their sizes reveal additions; key lookups reveal replacements.
+            $plain = (new \ReflectionProperty(RouteCollection::class, 'allRoutes'))->getValue($routes);
+            // Laravel 10–12 keep domain routes in allRoutes; 13 separates them.
+            $domains = property_exists(RouteCollection::class, 'allDomainRoutes')
+                ? (new \ReflectionProperty(RouteCollection::class, 'allDomainRoutes'))->getValue($routes)
+                : [];
+            $count = count($plain) + count($domains);
+            if ($this->indexedRouteCollection !== $routes || $this->indexedRouteCount !== $count) {
+                $this->literalRouteKeys = [];
+                $this->dynamicRouteKeys = [];
+                foreach ($domains as $key => $route) {
+                    $this->indexRegularRoute($route, $key, true);
+                }
+                foreach ($plain as $key => $route) {
+                    $this->indexRegularRoute($route, $key, false);
+                }
+                $this->indexedRouteCollection = $routes;
+                $this->indexedRouteCount = $count;
+            }
+
+            $candidates = array_merge(
+                $this->literalRouteKeys[$path] ?? [],
+                $this->dynamicRouteKeys[''] ?? [],
+                $segment === '' ? [] : ($this->dynamicRouteKeys[$segment] ?? []),
+            );
+            foreach ($candidates as [$key, $domain]) {
+                $route = $domain ? ($domains[$key] ?? null) : ($plain[$key] ?? null);
+                if ($route !== null && $this->servesProbe($route, $request)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Custom collections may not use Laravel's internal maps.
+        if (! $routes instanceof CompiledRouteCollection) {
+            foreach ($routes->getRoutes() as $route) {
+                if ($this->servesProbe($route, $request)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Enumerating compiled routes recreates every Route object, so index
+        // their static portion once and inspect only late additions thereafter.
+        if ($this->indexedRouteCollection !== $routes) {
+            $this->literalRoutes = [];
+            $this->dynamicRoutes = [];
+            $this->lateRoutes = (new \ReflectionProperty(CompiledRouteCollection::class, 'routes'))->getValue($routes);
+            foreach ($routes->getRoutes() as $route) {
+                $uri = trim($route->uri(), '/');
+                if ($route->isFallback || $this->isBroadRootRoute($route, $uri)) {
+                    continue;
+                }
+
+                if (str_contains($uri, '{')) {
+                    $first = explode('/', $uri, 2)[0];
+                    $bucket = str_contains($first, '{') ? '' : $first;
+                    $this->dynamicRoutes[$bucket][] = $route;
+                } else {
+                    $this->literalRoutes[$uri][] = $route;
+                }
+            }
+            $this->indexedRouteCollection = $routes;
+        }
+
+        // Ignore HTTP method, and check every candidate even when a catch-all
+        // was registered first.
+        $candidates = array_merge(
+            $this->literalRoutes[$path] ?? [],
+            $this->dynamicRoutes[''] ?? [],
+            $segment === '' ? [] : ($this->dynamicRoutes[$segment] ?? []),
+        );
+        foreach ($candidates as $route) {
+            if ($this->servesProbe($route, $request)) {
+                return true;
+            }
+        }
+
+        // Laravel stores post-cache registrations in a separate live
+        // RouteCollection; getRoutes() would reconstruct every compiled route.
+        if ($this->lateRoutes !== null) {
+            foreach ($this->lateRoutes->getRoutes() as $route) {
+                if ($this->servesProbe($route, $request)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function indexRegularRoute(LaravelRoute $route, string $key, bool $domain): void
+    {
+        $uri = trim($route->uri(), '/');
+
+        if (str_contains($uri, '{')) {
+            $first = explode('/', $uri, 2)[0];
+            $bucket = str_contains($first, '{') ? '' : $first;
+            $this->dynamicRouteKeys[$bucket][] = [$key, $domain];
+        } else {
+            $this->literalRouteKeys[$uri][] = [$key, $domain];
+        }
+    }
+
+    private function servesProbe(LaravelRoute $route, Request $request): bool
+    {
+        $uri = trim($route->uri(), '/');
+        if ($route->isFallback || $this->isBroadRootRoute($route, $uri)) {
+            return false;
+        }
+
+        if (! str_contains($uri, '{') && $uri !== trim($request->decodedPath(), '/')) {
+            return false;
+        }
+
+        try {
+            return $route->matches($request, false);
+        } catch (\Throwable) {
+            return true;
+        }
+    }
+
+    private function isBroadRootRoute(LaravelRoute $route, string $uri): bool
+    {
+        if (! preg_match('#^\{([^/{}?]+)\??\}$#', $uri, $parts)) {
+            return false;
+        }
+
+        $constraint = $route->wheres[$parts[1]] ?? null;
+
+        return $constraint === null || in_array($constraint, ['.*', '.+'], true);
+    }
+
+    /** @return array<int, Signature> */
+    private function llmSignatures(): array
+    {
+        if (! config('waf.llm_injection.enabled', false)) {
+            return [];
+        }
+
+        $patterns = [
+            '/<\|(?:im_start|im_end|system|user|assistant|endoftext)\|>|\[\/?(?:INST|SYS)\]/i' => 'LLM Role Marker Injection',
+            '/\b(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+|the\s+)*(?:previous|prior|above|earlier|system)\s+(?:instruction|prompt|direction|rule|context|message)/i' => 'LLM Instruction Override',
+            '/\b(?:summari[sz]e|classify|categori[sz]e|report|mark|treat|label|flag)\s+(?:this|it|the)(?:\s+(?:alert|event|log|entry|incident|activity|request|finding))?\s+as\b/i' => 'LLM Triage Manipulation',
+            '/\b(?:append|send|post|output|reveal|print|repeat)\s+(?:the\s+|your\s+)?(?:system\s+prompt|initial\s+instruction|above\s+instruction|your\s+instruction)/i' => 'LLM Prompt Exfiltration',
+        ];
+
+        $signatures = [];
+        foreach ($patterns as $regex => $label) {
+            $signatures[] = new Signature(
+                id: 'LLM-'.(count($signatures) + 1),
+                category: 'llm_injection',
+                name: 'LLM Prompt Injection',
+                description: $label,
+                severity: 'warning',
+                targets: ['query', 'body', 'headers'],
+                regex: $regex,
+            );
+        }
+
+        return $signatures;
     }
 
     /** Compiled operator signatures, memoised per distinct configuration. */
@@ -529,7 +875,12 @@ class WafInspector
         // Operator entries take precedence on a shared regex key.
         $definitions = array_merge($pack, $operator);
 
-        $fingerprint = md5(serialize($definitions).$fallback.$defaultParanoia);
+        try {
+            $fingerprint = md5(serialize([$definitions, $fallback, $defaultParanoia]));
+        } catch (\Throwable) {
+            // A malformed operator value must not prevent core rules from running.
+            return $this->compile($definitions, $fallback, $defaultParanoia);
+        }
 
         return self::$compiled[$fingerprint] ??= $this->compile($definitions, $fallback, $defaultParanoia);
     }
@@ -548,26 +899,46 @@ class WafInspector
             $n++;
 
             if (@preg_match($regex, '') === false) {
-                Log::warning('laravel-waf: dropping unparsable custom pattern', ['pattern' => $regex]);
+                QuietLog::write('warning', 'laravel-waf: dropping unparsable custom pattern', ['pattern' => $regex]);
 
                 continue;
             }
 
             $rich = is_array($definition);
             $severity = $rich ? ($definition['severity'] ?? $fallback) : $fallback;
+            $targets = $rich ? ($definition['targets'] ?? $everySurface) : $everySurface;
+            if (! is_array($targets) || $targets === []
+                || array_filter($targets, fn ($target): bool => ! is_string($target) || ! in_array($target, $everySurface, true))) {
+                QuietLog::write('warning', 'laravel-waf: dropping custom pattern with invalid targets', ['pattern' => $regex]);
 
-            $signatures[] = new Signature(
-                id: 'CUSTOM-'.$n,
-                category: 'custom',
-                name: 'Custom Pattern',
-                description: $rich ? ($definition['label'] ?? 'Custom Pattern') : (string) $definition,
-                severity: in_array($severity, self::SEVERITIES, true) ? $severity : $fallback,
-                targets: $rich ? ($definition['targets'] ?? $everySurface) : $everySurface,
-                regex: $regex,
-                paranoia: $rich ? (int) ($definition['paranoia'] ?? $defaultParanoia) : $defaultParanoia,
-                decisive: $rich && (bool) ($definition['decisive'] ?? false),
-                validator: $rich && isset($definition['validator']) ? (string) $definition['validator'] : null,
-            );
+                continue;
+            }
+
+            if ($rich && ((isset($definition['label']) && ! is_string($definition['label']))
+                || (isset($definition['validator']) && ! is_string($definition['validator']))
+                || (isset($definition['paranoia']) && filter_var($definition['paranoia'], FILTER_VALIDATE_INT) === false))) {
+                QuietLog::write('warning', 'laravel-waf: dropping malformed custom pattern', ['pattern' => $regex]);
+
+                continue;
+            }
+
+            try {
+                $signatures[] = new Signature(
+                    id: 'CUSTOM-'.$n,
+                    category: 'custom',
+                    name: 'Custom Pattern',
+                    description: $rich ? ($definition['label'] ?? 'Custom Pattern') : (string) $definition,
+                    severity: in_array($severity, self::SEVERITIES, true) ? $severity : $fallback,
+                    targets: $targets,
+                    regex: $regex,
+                    paranoia: $rich ? (int) ($definition['paranoia'] ?? $defaultParanoia) : $defaultParanoia,
+                    decisive: $rich && (bool) ($definition['decisive'] ?? false),
+                    validator: $rich && isset($definition['validator']) ? $definition['validator'] : null,
+                    streamingMkfifo: $rich && ($definition['streaming_mkfifo'] ?? false) === true,
+                );
+            } catch (\Throwable $e) {
+                QuietLog::write('warning', 'laravel-waf: dropping malformed custom pattern', ['pattern' => $regex, 'error' => $e->getMessage()]);
+            }
         }
 
         return $signatures;
@@ -577,47 +948,73 @@ class WafInspector
      * Store the finding (inline or via queue) and broadcast it. A short-lived
      * throttle key collapses bursts of the same finding from one client.
      */
-    private function record(Request $request, InspectionResult $result, bool $accepted): void
+    private function record(Request $request, InspectionResult $result, bool $accepted, bool $redactEvidence = false): void
     {
-        $ip = (string) $request->ip();
+        $ip = ClientIp::from($request);
         $signature = $result->summary();
+        $identity = implode('|', $result->signatures()).'#'.$this->action($result, $accepted);
 
         // The dedup key optionally folds in the request path, so the same attack
         // aimed at many endpoints is not collapsed into a single finding (which
         // would hide its breadth from the correlation analytics).
         $scope = config('waf.dedup_include_path', false)
-            ? $ip.'#'.$request->path().'#'.$signature
-            : $ip.'#'.$signature;
+            ? $ip.'#'.$request->path().'#'.$identity
+            : $ip.'#'.$identity;
 
         $hash = md5($scope);
         $seenKey = 'laravel-waf|seen|'.$hash;
-        $window = now()->addMinutes((int) config('waf.dedup_minutes', 5));
+        $eventId = (string) Str::uuid();
+        $createdAt = now();
+        $minutes = (int) config('waf.dedup_minutes', 5);
+        $window = $createdAt->copy()->addMinutes($minutes);
+        $store = (string) config('cache.default');
+        $dedup = $minutes > 0 && config("cache.stores.{$store}.driver", $store) !== 'null';
 
         // Cache::add is atomic: a false return means we saw this very recently.
         // Rather than drop the duplicate outright, bump the hit counter on the
         // finding it collapses into, so the true volume stays visible to the
         // correlation analytics without writing a new row.
-        if (! Cache::add($seenKey, true, $window)) {
-            $this->bumpHitCount($hash);
+        $new = true;
+        if ($dedup) {
+            try {
+                $new = Cache::add($seenKey, [
+                    'event_id' => $eventId,
+                    'created_at' => $createdAt->toISOString(),
+                ], $window);
+            } catch (\Throwable $e) {
+                CacheFailure::report($e);
+            }
+        }
+
+        if (! $new) {
+            try {
+                app(DedupCounter::class)->duplicate($seenKey);
+            } catch (\Throwable $e) {
+                CacheFailure::report($e);
+            }
 
             return;
         }
 
         // A stable id that identifies this finding in both the sync and queued
         // storage paths, so a ThreatDetected listener can reference the row.
-        $eventId = (string) Str::uuid();
-
-        // Mask any captured secrets before they touch storage.
+        // A single captured secret cannot rule out more in other fields.
         $secrets = $this->redactor->sensitiveValues($result->matches);
-        $url = $this->redactor->scrub(mb_substr($request->fullUrl(), 0, 2000), $secrets);
-        $payload = $this->redactor->scrub(mb_substr($this->evidence($result), 0, 4000), $secrets);
+        $containsSecret = $secrets !== [] || $redactEvidence;
+        $requestUrl = $this->requestUrl($request);
+        $url = $this->redactor->storable($containsSecret
+            ? '[REDACTED]' : $this->redactor->fields($requestUrl), 2000);
+        $payload = $this->redactor->storable($containsSecret
+            ? '[REDACTED]' : $this->redactor->fields($this->evidence($result)), 4000);
 
         $row = [
             'event_id' => $eventId,
             'ip_address' => $ip,
-            'method' => $request->method(),
+            'method' => $this->redactor->storable($request->method(), 10),
             'url' => $url,
-            'user_agent' => mb_substr((string) $request->userAgent(), 0, 500),
+            'target_hash' => TargetHash::fromUrl($requestUrl),
+            'user_agent' => $this->redactor->storable($containsSecret
+                ? '[REDACTED]' : $this->redactor->fields((string) $request->userAgent()), 500),
             'type' => $signature,
             'category' => $this->classify($result),
             'rule_ids' => implode(',', $result->ruleIds()),
@@ -628,25 +1025,31 @@ class WafInspector
             'confidence_label' => $result->confidenceLabel(),
             'action_taken' => $this->action($result, $accepted),
             'hit_count' => 1,
-            'user_id' => Auth::id(),
-            'created_at' => now(),
-            'updated_at' => now(),
+            'user_id' => $this->userId(),
+            'created_at' => $createdAt,
+            'updated_at' => $createdAt,
         ];
 
-        $id = $this->persist($row);
+        $id = $this->persist($row, $dedup ? $seenKey : null);
 
-        if ($id === false) {
+        if ($dedup && $id === false) {
             // The write failed, so release the dedup slot — otherwise the
             // finding stays suppressed for the whole window with nothing
             // stored, and the attack disappears from the log entirely.
-            Cache::forget($seenKey);
-        } elseif ($id !== null) {
-            // Remember the row id (inline path only) so later duplicates within
-            // the window can bump its hit counter instead of being dropped.
-            Cache::put($seenKey, $id, $window);
+            try {
+                app(DedupCounter::class)->failed($seenKey, $eventId);
+            } catch (\Throwable $e) {
+                CacheFailure::report($e);
+            }
+        } elseif ($dedup && $id !== null) {
+            try {
+                app(DedupCounter::class)->stored($seenKey, $eventId);
+            } catch (\Throwable $e) {
+                CacheFailure::report($e);
+            }
         }
 
-        Log::warning('laravel-waf finding recorded', [
+        QuietLog::write('warning', 'laravel-waf finding detected', [
             'ip' => $ip,
             'event_id' => $eventId,
             'signature' => $signature,
@@ -655,69 +1058,25 @@ class WafInspector
             'action' => $row['action_taken'],
         ]);
 
-        ThreatDetected::dispatch($row, $result, $ip, $eventId);
+        QuietEvent::dispatch(new ThreatDetected($row, $result, $ip, $eventId));
     }
 
-    /**
-     * Account for a duplicate that the dedup window collapsed into an existing
-     * finding by bumping its hit counter.
-     *
-     * The row id was cached against the dedup key when the finding was first
-     * written. It is only present on the inline storage path — under queueing
-     * the row doesn't exist yet, so duplicates there are simply not tallied.
-     *
-     * To keep this off the database on a route under attack, the bumps are
-     * accumulated in the cache and flushed to the row at most once per
-     * `dedup_flush_seconds` (so the stored count is eventually consistent, up
-     * to a small tail loss if the attack stops mid-interval). Set the interval
-     * to 0 to write every bump straight through.
-     */
-    private function bumpHitCount(string $hash): void
-    {
-        $id = Cache::get('laravel-waf|seen|'.$hash);
-
-        if (! is_int($id)) {
-            return;
-        }
-
-        $flushSeconds = (int) config('waf.dedup_flush_seconds', 10);
-
-        if ($flushSeconds <= 0) {
-            $this->applyHitCount($id, 1);
-
-            return;
-        }
-
-        // Accumulate the bump in the cache — atomic and off the database.
-        $pendingKey = 'laravel-waf|pending|'.$hash;
-        $window = now()->addMinutes((int) config('waf.dedup_minutes', 5));
-        Cache::add($pendingKey, 0, $window);
-        Cache::increment($pendingKey);
-
-        // Flush the accumulated count in a single write, at most once per
-        // interval. The cooldown slot is claimed atomically with Cache::add.
-        $flushKey = 'laravel-waf|flushed|'.$hash;
-        if (! Cache::add($flushKey, true, now()->addSeconds($flushSeconds))) {
-            return;
-        }
-
-        $amount = (int) Cache::get($pendingKey, 0);
-        if ($amount > 0) {
-            // Decrement (not pull) so bumps landing between the read and here
-            // stay counted for the next flush rather than being lost.
-            Cache::decrement($pendingKey, $amount);
-            $this->applyHitCount($id, $amount);
-        }
-    }
-
-    private function applyHitCount(int $id, int $amount): void
+    private function userId(): int|string|null
     {
         try {
-            DB::table(config('waf.table_name', 'waf_logs'))
-                ->where('id', $id)
-                ->increment('hit_count', $amount, ['updated_at' => now()]);
-        } catch (\Throwable $e) {
-            Log::error('laravel-waf: could not bump hit count', ['error' => $e->getMessage()]);
+            return Auth::id();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function requestUrl(Request $request): string
+    {
+        try {
+            return $request->fullUrl();
+        } catch (\Throwable) {
+            // Forwarded headers can conflict; keep the raw request target as evidence.
+            return 'http://'.(string) $request->server->get('HTTP_HOST', '').$request->getRequestUri();
         }
     }
 
@@ -726,20 +1085,29 @@ class WafInspector
      * @return int|false|null the inserted row id (inline path), null when
      *                        queued, or false when the inline write failed
      */
-    private function persist(array $row): int|false|null
+    private function persist(array $row, ?string $dedupKey): int|false|null
     {
         if (config('waf.queue.enabled', false)) {
-            StoreWafLog::dispatch($row)
-                ->onConnection(config('waf.queue.connection'))
-                ->onQueue(config('waf.queue.queue', 'default'));
+            try {
+                Bus::dispatch((new StoreWafLog($row, $dedupKey))
+                    ->onConnection(config('waf.queue.connection'))
+                    ->onQueue(config('waf.queue.queue', 'default')));
 
-            return null;
+                return null;
+            } catch (\Throwable $e) {
+                if (! self::$queueFailureWarned) {
+                    self::$queueFailureWarned = true;
+                    QuietLog::write('warning', 'laravel-waf: queue unavailable; writing findings directly', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
         }
 
         try {
-            return (int) DB::table(config('waf.table_name', 'waf_logs'))->insertGetId($row);
+            return (new StoreWafLog($row))->storeInline() ?? false;
         } catch (\Throwable $e) {
-            Log::error('laravel-waf: could not persist finding', ['error' => $e->getMessage()]);
+            QuietLog::write('error', 'laravel-waf: could not persist finding', ['error' => $e->getMessage()]);
             $this->explainPersistFailure(array_keys($row));
 
             return false;
@@ -765,7 +1133,7 @@ class WafInspector
             $table = (string) config('waf.table_name', 'waf_logs');
 
             if (! Schema::hasTable($table)) {
-                Log::error(
+                QuietLog::write('error',
                     "laravel-waf: findings are being discarded — the '{$table}' table does not exist. "
                     .'Run: php artisan vendor:publish --tag=waf-migrations && php artisan migrate. '
                     .'Then verify with: php artisan waf:doctor'
@@ -780,7 +1148,7 @@ class WafInspector
             ));
 
             if ($missing !== []) {
-                Log::error(
+                QuietLog::write('error',
                     "laravel-waf: findings are being discarded — '{$table}' is missing the "
                     .implode(', ', $missing).' column(s); the package was likely upgraded without its '
                     .'upgrade migration. Run: php artisan vendor:publish --tag=waf-migrations-upgrade '

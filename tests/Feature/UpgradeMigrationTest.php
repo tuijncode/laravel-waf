@@ -55,13 +55,34 @@ it('is idempotent — safe to run against an already-upgraded table', function (
     expect(Schema::hasColumn('waf_logs', 'event_id'))->toBeTrue();
 });
 
-it('rolls back cleanly', function () use ($runUpgrade) {
+it('preserves upgraded columns and data on rollback', function () use ($runUpgrade) {
     rebuildLegacyWafLogs();
     $runUpgrade();
     expect(Schema::hasColumn('waf_logs', 'event_id'))->toBeTrue();
 
+    DB::table('waf_logs')->insert([
+        'event_id' => '22222222-2222-2222-2222-222222222222',
+        'ip_address' => '203.0.113.2',
+        'url' => '/',
+        'type' => 't',
+        'category' => 'sqli',
+        'hit_count' => 3,
+    ]);
+
     $migration = require __DIR__.'/../../database/migrations/upgrade_waf_logs_table.php.stub';
     $migration->down();
 
-    expect(Schema::hasColumn('waf_logs', 'event_id'))->toBeFalse();
+    expect(Schema::hasColumn('waf_logs', 'event_id'))->toBeTrue()
+        ->and(Schema::hasColumn('waf_logs', 'hit_count'))->toBeTrue()
+        ->and(DB::table('waf_logs')->value('hit_count'))->toBe(3);
+});
+
+it('preserves pre-existing columns on rollback', function () use ($runUpgrade) {
+    $runUpgrade();
+
+    $migration = require __DIR__.'/../../database/migrations/upgrade_waf_logs_table.php.stub';
+    $migration->down();
+
+    expect(Schema::hasColumn('waf_logs', 'event_id'))->toBeTrue()
+        ->and(Schema::hasColumn('waf_logs', 'hit_count'))->toBeTrue();
 });

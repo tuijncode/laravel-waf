@@ -1,0 +1,40 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Tuijncode\LaravelWaf\Support\TargetHash;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        $table = config('waf.table_name', 'waf_logs');
+        if (! Schema::hasColumn($table, 'target_hash')) {
+            return;
+        }
+
+        if (! config('app.key') && DB::table($table)
+            ->whereNull('target_hash')
+            ->where('url', '!=', '[REDACTED]')
+            ->exists()) {
+            throw new \RuntimeException('Set APP_KEY before backfilling WAF target hashes.');
+        }
+
+        // Match older visible findings with redacted findings at the same target.
+        foreach (DB::table($table)
+            ->whereNull('target_hash')
+            ->where('url', '!=', '[REDACTED]')
+            ->select('id', 'url')
+            ->lazyById(100) as $finding) {
+            DB::table($table)->where('id', $finding->id)->update([
+                'target_hash' => TargetHash::fromUrl($finding->url),
+            ]);
+        }
+    }
+
+    public function down(): void
+    {
+        // Existing hashes may have been written by live traffic; keep them.
+    }
+};

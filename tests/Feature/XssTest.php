@@ -23,3 +23,9 @@ it('detects and logs a cross-site scripting attempt', function () {
         return in_array('941100', $event->result->ruleIds(), true);
     });
 });
+
+it('does not treat a longer element name as a script tag', function () {
+    $this->get('/?q='.rawurlencode('<scripted>safe</scripted>'))->assertOk();
+
+    expect(DB::table('waf_logs')->count())->toBe(0);
+});

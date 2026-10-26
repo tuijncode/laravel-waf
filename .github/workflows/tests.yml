@@ -44,6 +44,61 @@ jobs:
       - name: Run Pest
         run: vendor/bin/pest
 
+  database-locks:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { driver: mysql, image: 'mysql:8.0', port: 3306, health: 'mysqladmin ping -h localhost -uwaf_test -pwaf_test' }
+          - { driver: pgsql, image: 'postgres:16', port: 5432, health: 'pg_isready -U waf_test' }
+
+    name: Database locks · ${{ matrix.driver }}
+
+    services:
+      database:
+        image: ${{ matrix.image }}
+        env:
+          MYSQL_DATABASE: waf_test
+          MYSQL_USER: waf_test
+          MYSQL_PASSWORD: waf_test
+          MYSQL_ROOT_PASSWORD: waf_test
+          POSTGRES_DB: waf_test
+          POSTGRES_USER: waf_test
+          POSTGRES_PASSWORD: waf_test
+        ports:
+          - ${{ matrix.port }}:${{ matrix.port }}
+        options: >-
+          --health-cmd "${{ matrix.health }}"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      WAF_TEST_DB_DRIVER: ${{ matrix.driver }}
+      WAF_TEST_RESET_DB: '1'
+      WAF_TEST_DB_PORT: ${{ matrix.port }}
+      WAF_TEST_DB_NAME: waf_test
+      WAF_TEST_DB_USER: waf_test
+      WAF_TEST_DB_PASSWORD: waf_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_mysql, pdo_pgsql
+          coverage: none
+
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Verify database locking and user ID storage
+        run: vendor/bin/pest tests/Feature/DatabaseLockingTest.php tests/Feature/UserIdStorageTest.php
+
   quality:
     runs-on: ubuntu-latest
     name: static analysis & style

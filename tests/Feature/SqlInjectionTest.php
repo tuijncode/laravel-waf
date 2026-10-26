@@ -3,6 +3,7 @@
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Tuijncode\LaravelWaf\Events\ThreatDetected;
+use Tuijncode\LaravelWaf\Support\TargetHash;
 
 // http://localhost:8000/?q=' UNION SELECT * FROM users--
 it('detects and logs a SQL injection attempt', function () {
@@ -19,6 +20,7 @@ it('detects and logs a SQL injection attempt', function () {
         ->and($log->category)->toBe('sqli')
         ->and($log->threat_level)->toBe('critical')
         ->and($log->rule_ids)->toContain('942100')
+        ->and($log->target_hash)->toBe(TargetHash::fromUrl('http://localhost/'))
         ->and($log->confidence_score)->toBeGreaterThanOrEqual(40);
 
     Event::assertDispatched(ThreatDetected::class, function (ThreatDetected $event) {

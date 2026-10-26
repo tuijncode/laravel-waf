@@ -1,7 +1,9 @@
 <?php
 
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\RateLimiter;
 use Tuijncode\LaravelWaf\Events\IpBanned;
 use Tuijncode\LaravelWaf\Services\AutoBanManager;
 
@@ -31,6 +33,17 @@ it('bans a client after repeated blocks and refuses it up front', function () us
     expect(DB::table('waf_logs')->count())->toBe(1);
 });
 
+it('enforces a ban on skipped paths while honoring the IP whitelist', function () use ($attack) {
+    config()->set('waf.skip_paths', ['health/*']);
+    $this->get($attack())->assertForbidden();
+    $this->get($attack())->assertForbidden();
+
+    $this->get('/health/check')->assertForbidden()->assertHeader('Retry-After', '3600');
+
+    config()->set('waf.whitelisted_ips', ['127.0.0.1']);
+    $this->get('/health/check')->assertOk();
+});
+
 it('never bans while the feature is disabled', function () use ($attack) {
     config()->set('waf.auto_ban.enabled', false);
 
@@ -55,6 +68,20 @@ it('dispatches IpBanned once when the ban is applied', function () use ($attack)
 
     Event::assertDispatchedTimes(IpBanned::class, 1);
     Event::assertDispatched(IpBanned::class, fn (IpBanned $e) => $e->ipAddress === '127.0.0.1' && $e->seconds === 3600);
+});
+
+it('announces a ban only for the worker that atomically claims it', function () {
+    Event::fake([IpBanned::class]);
+    RateLimiter::shouldReceive('hit')->twice()->andReturn(2, 3);
+    Cache::shouldReceive('add')->twice()->andReturn(true, false);
+    Cache::shouldNotReceive('has');
+    Cache::shouldNotReceive('put');
+
+    $bans = app(AutoBanManager::class);
+    $bans->strike('127.0.0.1');
+    $bans->strike('127.0.0.1');
+
+    Event::assertDispatchedTimes(IpBanned::class, 1);
 });
 
 it('lifts a standing ban', function () use ($attack) {

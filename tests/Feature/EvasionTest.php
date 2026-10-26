@@ -58,6 +58,16 @@ it('sees through backslash-x escaped traversal', function () {
         ->and($log->rule_ids)->toContain('930110');
 });
 
+it('repeats decoding when a backslash escape reveals URL encoding', function () {
+    // The first pass turns \x25 into %, and the next turns %3C into <.
+    $this->get('/?q='.rawurlencode('\x253Cscript\x253Ealert(1)\x253C/script\x253E'))->assertOk();
+
+    $log = DB::table('waf_logs')->first();
+
+    expect($log)->not->toBeNull()
+        ->and($log->rule_ids)->toContain('941100');
+});
+
 it('sees through null-byte splitting', function () {
     // /etc/pass\0wd — the null byte splits the signature until it is stripped.
     $this->get('/?file=/etc/pass%00wd')->assertOk();

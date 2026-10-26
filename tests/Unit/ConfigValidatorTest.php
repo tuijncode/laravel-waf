@@ -8,6 +8,12 @@ it('passes the shipped default configuration', function () {
     expect($this->validator->validate())->toBe([]);
 });
 
+it('requires an app key when redacted targets need keyed hashes', function () {
+    config()->set('app.key', '');
+
+    expect($this->validator->validate())->toContain('APP_KEY is required for keyed hashes of redacted WAF targets.');
+});
+
 it('flags an invalid mode', function () {
     config()->set('waf.mode', 'blockign');
 
@@ -38,12 +44,6 @@ it('flags a non-positive ddos threshold', function () {
     config()->set('waf.ddos.threshold', 0);
 
     expect(implode(' ', $this->validator->validate()))->toContain('waf.ddos.threshold');
-});
-
-it('flags an out-of-range dedup flush interval', function () {
-    config()->set('waf.dedup_flush_seconds', -1);
-
-    expect(implode(' ', $this->validator->validate()))->toContain('waf.dedup_flush_seconds');
 });
 
 it('flags an unknown disabled category', function () {
@@ -79,10 +79,61 @@ it('flags a non-array enabled_environments', function () {
     expect(implode(' ', $this->validator->validate()))->toContain('waf.enabled_environments');
 });
 
+it('flags non-string enabled environments', function () {
+    config()->set('waf.enabled_environments', [42]);
+
+    expect(implode(' ', $this->validator->validate()))->toContain('waf.enabled_environments entries');
+});
+
+it('flags path lists that are not arrays of strings', function () {
+    config()->set('waf.only_paths', 'api/*');
+    config()->set('waf.skip_paths', [['ignored/*']]);
+
+    $problems = implode(' ', $this->validator->validate());
+    expect($problems)->toContain('waf.only_paths')->toContain('waf.skip_paths');
+});
+
 it('flags a non-positive auto_ban setting', function () {
     config()->set('waf.auto_ban.max_blocks', 0);
 
     expect(implode(' ', $this->validator->validate()))->toContain('waf.auto_ban.max_blocks');
+});
+
+it('flags invalid retention settings', function () {
+    config()->set('waf.retention.days', 'invalid');
+    config()->set('waf.attempts.retention_days', 0);
+
+    $problems = implode(' ', $this->validator->validate());
+    expect($problems)->toContain('waf.retention.days')
+        ->toContain('waf.attempts.retention_days');
+});
+
+it('flags invalid attempt cap and window settings', function () {
+    config()->set('waf.attempts.window_minutes', 0);
+    config()->set('waf.attempts.max_per_ip', 'invalid');
+
+    $problems = implode(' ', $this->validator->validate());
+    expect($problems)->toContain('waf.attempts.window_minutes')
+        ->toContain('waf.attempts.max_per_ip');
+});
+
+it('allows older attempt configuration without cap and window settings', function () {
+    config()->set('waf.attempts.window_minutes', null);
+    config()->set('waf.attempts.max_per_ip', null);
+
+    expect($this->validator->validate())->toBe([]);
+});
+
+it('flags an unsafe shared-payload row budget', function () {
+    config()->set('waf.attempts.max_correlation_rows', 100001);
+
+    expect(implode(' ', $this->validator->validate()))->toContain('waf.attempts.max_correlation_rows');
+});
+
+it('uses the default row budget with an older published attempt config', function () {
+    config()->set('waf.attempts.max_correlation_rows', null);
+
+    expect($this->validator->validate())->toBe([]);
 });
 
 it('flags an unparsable custom pattern regex', function () {
@@ -107,6 +158,21 @@ it('flags an unknown custom pattern target surface', function () {
     expect(implode(' ', $this->validator->validate()))->toContain("unknown surface 'querry'");
 });
 
+it('flags malformed custom pattern metadata', function () {
+    config()->set('waf.custom_patterns', [
+        '/bad-target/i' => ['label' => 'Bad target', 'targets' => 'query'],
+        '/bad-label/i' => ['label' => ['unexpected'], 'targets' => ['query']],
+        '/bad-validator/i' => ['label' => 'Bad validator', 'validator' => ['luhn']],
+        '/bad-paranoia/i' => ['label' => 'Bad paranoia', 'paranoia' => []],
+    ]);
+
+    $problems = implode(' ', $this->validator->validate());
+    expect($problems)->toContain('targets must be a non-empty array')
+        ->toContain('label must be a string')
+        ->toContain('names unknown validator')
+        ->toContain('paranoia must be an integer between 1 and 4');
+});
+
 it('flags an unknown custom pattern validator', function () {
     config()->set('waf.custom_patterns', [
         '/ok/i' => ['label' => 'X', 'validator' => 'moon-phase'],
@@ -118,6 +184,14 @@ it('flags an unknown custom pattern validator', function () {
 it('accepts the built-in luhn validator', function () {
     config()->set('waf.custom_patterns', [
         '/ok/i' => ['label' => 'X', 'validator' => 'luhn'],
+    ]);
+
+    expect($this->validator->validate())->toBe([]);
+});
+
+it('keeps broad Luhn patterns available for bounded runtime inspection', function () {
+    config()->set('waf.custom_patterns', [
+        '/\d/' => ['label' => 'Digits', 'validator' => 'luhn'],
     ]);
 
     expect($this->validator->validate())->toBe([]);

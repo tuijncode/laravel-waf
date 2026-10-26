@@ -6,6 +6,8 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Tuijncode\LaravelWaf\Support\CacheFailure;
+use Tuijncode\LaravelWaf\Support\TargetHash;
 
 /**
  * Allow-list for tuning out noise.
@@ -35,32 +37,63 @@ class ExclusionRuleService
      */
     public function accepts(string $signature, string $path): bool
     {
-        $path = trim((string) parse_url($path, PHP_URL_PATH), '/');
+        return $this->acceptsAll([$signature], $path);
+    }
 
-        // "[942100] SQL Injection Attack: ..." → id and description handles.
-        $handles = [$signature];
-        if (preg_match('/^\[([^\]]+)\]\s*(.*)$/s', $signature, $parts)) {
-            $handles[] = $parts[1];
-            if ($parts[2] !== '') {
-                $handles[] = $parts[2];
+    /** @param array<int, string> $signatures */
+    public function acceptsAll(array $signatures, string $path): bool
+    {
+        $urlPath = parse_url($path, PHP_URL_PATH);
+        if ($urlPath === false) {
+            return false;
+        }
+
+        $targetHash = TargetHash::fromUrl($path);
+        $path = trim((string) $urlPath, '/');
+        $active = $this->active();
+
+        foreach ($signatures as $signature) {
+            // "[942100] SQL Injection Attack: ..." → id and description handles.
+            $handles = [$signature];
+            if (preg_match('/^\[([^\]]+)\]\s*(.*)$/s', $signature, $parts)) {
+                $handles[] = $parts[1];
+                if ($parts[2] !== '') {
+                    $handles[] = $parts[2];
+                }
+            }
+
+            if (! $active->contains(function (object $entry) use ($handles, $path, $targetHash): bool {
+                $label = trim((string) $entry->match_label);
+
+                if ($label === '' || ! in_array($label, $handles, true)) {
+                    return false;
+                }
+
+                if (blank($entry->path_glob)) {
+                    return true;
+                }
+
+                if ($entry->path_glob === '/') {
+                    return $path === '';
+                }
+
+                if (str_starts_with($entry->path_glob, 'sha256:')) {
+                    return $targetHash !== null && hash_equals(substr($entry->path_glob, 7), $targetHash);
+                }
+
+                return fnmatch($entry->path_glob, $path);
+            })) {
+                return false;
             }
         }
 
-        return $this->active()->contains(function (object $entry) use ($handles, $path): bool {
-            $label = trim((string) $entry->match_label);
-
-            if ($label === '' || ! in_array($label, $handles, true)) {
-                return false;
-            }
-
-            return blank($entry->path_glob) || fnmatch($entry->path_glob, $path);
-        });
+        return true;
     }
 
     /**
      * Promote a previously logged finding into a standing exclusion.
      */
-    public function acceptFromLog(int $logId, ?int $userId = null, ?string $reason = null): ?object
+    public function acceptFromLog(int $logId, int|string|null $userId = null, ?string $reason = null): ?object
     {
         $finding = DB::table(config('waf.table_name', 'waf_logs'))->find($logId);
 
@@ -76,10 +109,69 @@ class ExclusionRuleService
             ? $hit[1]
             : $finding->type;
 
-        $newId = DB::table(self::TABLE)->insertGetId([
+        $labels = array_values(array_unique(array_filter(array_map(
+            trim(...),
+            explode(',', (string) ($finding->rule_ids ?? '')),
+        ))));
+        if ($labels === []) {
+            $labels = [$label];
+        }
+
+        $targetHash = $finding->target_hash ?? null;
+        if ($targetHash === null && $finding->url === '[REDACTED]') {
+            throw new \InvalidArgumentException('Cannot scope an exclusion from a redacted legacy log. Add a manual exclusion with an explicit path.');
+        }
+
+        if ($finding->url === '[REDACTED]') {
+            $path = 'sha256:'.$targetHash;
+        } else {
+            $urlPath = parse_url($finding->url, PHP_URL_PATH);
+            if ($urlPath === false) {
+                throw new \InvalidArgumentException('Cannot scope an exclusion from a malformed log URL. Add a manual exclusion with an explicit path.');
+            }
+            $path = addcslashes(trim((string) $urlPath, '/'), '*?[]\\');
+        }
+        $path = $path === '' ? '/' : $path;
+        $newId = DB::transaction(function () use ($labels, $path, $logId, $userId, $reason): int {
+            $firstId = 0;
+            foreach ($labels as $matchLabel) {
+                $id = DB::table(self::TABLE)->insertGetId([
+                    'match_label' => $matchLabel,
+                    'path_glob' => $path,
+                    'source_log_id' => $logId,
+                    'created_by_user_id' => $userId,
+                    'reason' => $reason,
+                    'is_active' => true,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+                $firstId = $firstId ?: $id;
+            }
+
+            return $firstId;
+        });
+
+        $this->refresh();
+
+        return DB::table(self::TABLE)->find($newId);
+    }
+
+    /** Create a manual exclusion and make it effective immediately. */
+    public function add(string $label, ?string $pathGlob = null, int|string|null $userId = null, ?string $reason = null): ?object
+    {
+        $label = trim($label);
+        if ($label === '') {
+            throw new \InvalidArgumentException('An exclusion label is required.');
+        }
+
+        $path = $pathGlob === null ? null : trim($pathGlob, '/');
+        if ($pathGlob !== null && $pathGlob !== '' && $path === '') {
+            $path = '/';
+        }
+
+        $id = DB::table(self::TABLE)->insertGetId([
             'match_label' => $label,
-            'path_glob' => trim((string) parse_url($finding->url, PHP_URL_PATH), '/') ?: null,
-            'source_log_id' => $logId,
+            'path_glob' => $path,
             'created_by_user_id' => $userId,
             'reason' => $reason,
             'is_active' => true,
@@ -89,7 +181,7 @@ class ExclusionRuleService
 
         $this->refresh();
 
-        return DB::table(self::TABLE)->find($newId);
+        return DB::table(self::TABLE)->find($id);
     }
 
     public function drop(int $ruleId): bool
@@ -117,7 +209,11 @@ class ExclusionRuleService
 
     public function refresh(): void
     {
-        Cache::forget(self::CACHE_BUCKET);
+        try {
+            Cache::forget(self::CACHE_BUCKET);
+        } catch (\Throwable $e) {
+            CacheFailure::report($e);
+        }
     }
 
     /**
@@ -130,12 +226,24 @@ class ExclusionRuleService
         // which defaults to false in Laravel 12+), so a cached Collection or
         // stdClass would come back as __PHP_Incomplete_Class and make this
         // method throw — silently disabling the WAF. Rebuild the objects on read.
-        $rows = Cache::remember(self::CACHE_BUCKET, now()->addMinutes(10), function (): array {
+        $load = function (): array {
             return $this->installed()
                 ? DB::table(self::TABLE)->where('is_active', true)->get()
                     ->map(static fn (object $row): array => (array) $row)->all()
                 : [];
-        });
+        };
+
+        try {
+            $rows = Cache::remember(self::CACHE_BUCKET, now()->addMinutes(10), $load);
+        } catch (\Throwable $e) {
+            CacheFailure::report($e);
+            try {
+                $rows = $load();
+            } catch (\Throwable $e) {
+                CacheFailure::report($e);
+                $rows = [];
+            }
+        }
 
         return collect($rows)->map(static fn (array $row): object => (object) $row);
     }

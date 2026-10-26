@@ -1,0 +1,47 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (! Schema::hasTable('waf_hit_totals')) {
+            Schema::create('waf_hit_totals', function (Blueprint $table): void {
+                $table->uuid('event_id')->primary();
+                $table->unsignedBigInteger('hit_count')->default(0);
+                $table->timestamp('updated_at')->index();
+            });
+        }
+
+        if (! Schema::hasTable('waf_hit_events')) {
+            return;
+        }
+
+        foreach (DB::table('waf_hit_events')->select('event_id')
+            ->distinct()->orderBy('event_id')->cursor() as $row) {
+            DB::transaction(function () use ($row): void {
+                DB::table('waf_hit_totals')->insertOrIgnore([
+                    'event_id' => $row->event_id,
+                    'hit_count' => 0,
+                    'updated_at' => now(),
+                ]);
+                // A hit job updates this same row before committing its ledger entry.
+                DB::table('waf_hit_totals')->where('event_id', $row->event_id)
+                    ->lockForUpdate()->first(['event_id']);
+                $count = DB::table('waf_hit_events')->where('event_id', $row->event_id)->count();
+                DB::table('waf_hit_totals')->where('event_id', $row->event_id)
+                    ->where('hit_count', '<', $count)
+                    ->update(['hit_count' => $count, 'updated_at' => now()]);
+            });
+        }
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('waf_hit_totals');
+    }
+};

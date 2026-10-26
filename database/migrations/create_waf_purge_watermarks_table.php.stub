@@ -1,0 +1,25 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (Schema::hasTable('waf_purge_watermarks')) {
+            return;
+        }
+
+        Schema::create('waf_purge_watermarks', function (Blueprint $table): void {
+            $table->string('table_name', 191)->primary();
+            $table->timestamp('purged_before')->nullable();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('waf_purge_watermarks');
+    }
+};

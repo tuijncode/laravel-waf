@@ -191,7 +191,7 @@ return [
         // ---------------------------------------------------------------
         '/\b(?:c99|r57|b374k|wso|c100|weevely|filesman|indoxploit|alfa(?:team)?shell)\b/i' => $c('Web Shell Signature', ['query', 'body', 'path']),
         '/eval\s*\(\s*(?:base64_decode|gzinflate|str_rot13|gzuncompress|hex2bin)\s*\(/i' => $c('Encoded Eval Execution', ['query', 'body']),
-        '/(?:ba)?sh\s+-i\b|\/dev\/tcp\/|\bnc\s+-[a-z]*e\b|mkfifo\b[^|]*\|/i' => $c('Reverse Shell', ['query', 'body']),
+        '/(?:ba)?sh\s+-i\b|\/dev\/tcp\/|\bnc\s+-[a-z]*e\b|(?:^|[=;&|\r\n\x22\x27])[ \t]{0,32}mkfifo\b[ \t]+[^\s;|]+[ \t]*;[ \t]*cat\b[ \t]+[^\s|]+[^|]{0,12000}\|[ \t]*(?:\/(?:usr\/)?bin\/)?(?:ba)?sh\b/im' => $c('Reverse Shell', ['query', 'body']) + ['streaming_mkfifo' => true],
         '/(?:python[0-9.]*|perl|ruby)\s+-[a-z]+\s+["\'][^"\']*(?:socket|Socket)/i' => $c('Scripted Reverse Shell', ['query', 'body']),
         '/\b(?:coinhive|cryptonight|xmrig|minexmr|nicehash|supportxmr)\b/i' => $e('Crypto Miner', ['query', 'body']),
 

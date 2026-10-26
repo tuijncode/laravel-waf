@@ -14,7 +14,12 @@ class WafStatsCommand extends Command
 
     public function handle(): int
     {
-        $days = max(1, (int) $this->option('days'));
+        $days = filter_var($this->option('days'), FILTER_VALIDATE_INT);
+        if ($days === false || $days < 1) {
+            $this->error('--days must be a positive integer.');
+
+            return self::INVALID;
+        }
         $since = now()->subDays($days);
         $table = config('waf.table_name', 'waf_logs');
 

@@ -4,10 +4,273 @@ All notable changes to `tuijncode/laravel-waf` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] - 2026-10-26
+
+### Added
+
+- MySQL and PostgreSQL CI checks now verify that purge and finding writes honor
+  shared and exclusive database locks across separate connections.
+- Optional route-aware probes for unserved WordPress, cPanel, Swagger and other
+  paths (`WAF_PROBE_PATHS`), plus opt-in prompt-injection signals in request
+  data (`WAF_LLM_INJECTION`).
+- `waf:doctor` now warns when all connecting proxies are trusted for IP-based
+  WAF decisions, and when attempt recording is enabled without a scheduled purge.
+- Optional attempt-level variant hashes (`WAF_ATTEMPTS`) reveal changes to the
+  same attack that ordinary finding deduplication hides. `waf:correlate` reports
+  mutation chains, different payloads per IP and shared payloads across IPs;
+  `waf:purge` removes old attempt rows. `waf:correlate --rank` adds a read-only
+  IP risk ranking with visible score components.
+- An opt-in `WAF_AI_PROBES` pack identifies requests for common model and MCP
+  endpoints when the application does not serve that path. Coverage now includes
+  agent configuration files and more model and AI framework endpoints.
 
 ### Fixed
 
+- Route-aware probes and proxy diagnostics work across Laravel 10–13; Laravel
+  10 installations can run the column-widening migrations with Doctrine DBAL.
+- Direct model pruning now rolls back the cutoff, hit records and exclusion
+  links if a deleting observer vetoes or throws; invalid retention ages fail
+  before any pruning changes are made.
+- IP denylist decisions now honor `enabled_environments`, while still applying
+  to skipped paths in enabled environments.
+- `model:prune` respects Laravel's `--chunk` size and fires individual Eloquent
+  delete events; `waf:purge` remains the set-based option for large batches.
+- MySQL and PostgreSQL lock tests require an explicit reset opt-in and a
+  dedicated `_test` database before recreating test tables.
+- Database lock tests exercise a real finding write while the purge watermark
+  is exclusively locked, then verify that the stale retry is rejected.
+- Synchronous finding writes, including queue-dispatch fallbacks, now apply the
+  same transactional purge cutoff and event-marker checks as queued writes.
+- Legacy queued hit jobs use Laravel's dispatch timestamp when their serialized
+  finding timestamp is absent, so a purge cannot restore their hit records.
+- Rejected stale finding jobs no longer add permanent event markers; direct
+  prune markers expire once the global purge cutoff protects their queued jobs.
+- Directly pruned recent findings now retain an event marker, preventing queued
+  finding and hit retries from restoring deleted data.
+- Legacy queued hit jobs without a finding timestamp keep early duplicates
+  durable after a purge cutoff; stale finding jobs remove their pending hits.
+- `model:prune` records the retention cutoff even with no stored findings and
+  fails before processing when the watermark migration is missing.
+- Model pruning fixes one cutoff for the whole run and uses shared locks while
+  deleting rows, avoiding an exclusive watermark update for every finding.
+- Queued duplicates keep their finding ID and creation time in one atomic cache
+  claim, so a missing companion key cannot discard their durable hit record.
+- Percent-encoded credential parameter names no longer expose their values in
+  logged URLs and evidence.
+- `model:prune` uses the same durable purge cutoff as `waf:purge` and removes
+  hit records for deleted findings.
+- Delayed hit jobs cannot restore records for findings older than the purge
+  cutoff; purges also remove recent hit rows tied to deleted findings.
+- Queued finding and hit writes use a shared watermark lock, allowing concurrent
+  writes while retaining an exclusive lock for pruning.
+- Encoded JSON credentials in URLs are now redacted before a finding is stored.
+- The queued-hit totals migration locks each finding before its backfill count,
+  preserving concurrent hit increments.
+- Purges record a durable cutoff so delayed queue jobs cannot restore deleted
+  findings. `waf:doctor` reports when the new watermark migration is missing.
+- Sensitive JSON arrays and quoted credential values no longer leave plaintext
+  secrets in WAF log fields.
+- Queued hit jobs maintain a durable per-finding total instead of recounting
+  every preceding hit. The new migration backfills existing hit records.
+- `waf:doctor` detects missing hit-table columns, and queued flushes stop
+  retrying permanently when their hit schema is incomplete.
+- Credential array parameters such as `password[0]` are redacted from logged
+  URLs and evidence.
+- Queued findings with a missing log table or required columns now fail
+  terminally; flush jobs stop when their finding has been purged.
+- Every queued duplicate also has an idempotent durable hit record, so a cache
+  restart before the flush no longer loses its count. Old hit records are pruned
+  with the findings.
+- A rejected flush dispatch no longer leaves a successfully reconciled pending
+  count in cache for ten years.
+- Queued findings and hit-count flushes keep retrying through long database
+  outages; pending counts are reconciled and cleaned up after the dedup window.
+- Busy cache locks and delayed workers no longer create duplicate flush jobs.
+- `waf:doctor` verifies middleware on actual routes rather than unused groups.
+- A validated pattern that exceeds its candidate limit now follows `on_error`
+  instead of recording a false attack and blocking a legitimate request.
+- Duplicate requests no longer wait two seconds for a busy cache lock; the
+  queued fallback retains the hit and schedules a flush.
+- Broad validated patterns now stop after a bounded number of rejected matches;
+  valid alternatives remain active.
+- Queued duplicate counts are cumulative and idempotent across retries, and a
+  successful write no longer becomes a failed job when counter finalisation
+  fails. Failed writes keep their queued finding and deduplication slot for retry.
+- Failed exclusion reads no longer bypass blocking when `on_error=open`.
+- Queued findings keep their deduplication state when counter updates fail after
+  the finding was stored.
+- Large parsed request fields are streamed through bounded scan parts instead
+  of building multiple full-body copies in memory.
+- Validator signatures avoid collecting matches from unbounded subjects; long
+  operator surfaces no longer exhaust memory while evaluating candidates.
+- Duplicate hits still increment after a cache-lock timeout.
+- Directly constructed JSON requests now honour `safe_fields` in read-only
+  inspection.
+- Multipart text fields remain inspectable when an upload shares their parent
+  field name.
+- Non-serializable custom metadata no longer prevents core or valid custom
+  patterns from running.
+- Long percent-encoded operator matches are detected within the bounded
+  full-decode range.
+- Queued duplicate findings batch hit-count updates over short bursts instead
+  of writing once per repeated request.
+- Malformed operator patterns are reported and skipped without disabling valid
+  custom or core detection.
+- Host, language, transport and repeated header values are inspected for attacks.
+- Attempt fingerprints use bounded memory for large payloads while keeping
+  distinct raw tails separate.
+- Operator patterns can match raw request spans longer than a scan window.
+- Safe-field filtering now respects the assigned index of unnumbered query
+  arrays, avoiding false positives on excluded elements.
+- The bundled FIFO reverse-shell rule requires a shell pipeline, so prose with
+  an unrelated pipe character is not reported as an attack.
+- Attempt fingerprints normalise encoded variants within the first 256 KiB.
+- Raw query inspection preserves duplicate parameters, including when safe
+  fields are configured.
+- Reverse-shell detection no longer treats a prose mention of `mkfifo` followed
+  by an unrelated pipe character as a command.
+- Attempt fingerprints distinguish payloads that differ after the first 16 KiB.
+- Script tags with attributes longer than a scan window are detected by the
+  bundled XSS rule.
+- Invalid attempt cap and window settings are reported by `waf:doctor` and
+  fall back to their normal defaults instead of silently becoming `1`.
+- Queued `ThreatDetected` and `RequestBlocked` listeners now receive redacted
+  event copies, preventing raw request secrets from entering queue storage.
+- The bundled reverse-shell rule detects FIFO commands with long padding
+  without relying on an unbounded match across scan windows.
+- Shared-payload correlation checks its source-row budget before database
+  aggregation, so the result cap also bounds the expensive query input.
+- Built-in and operator patterns use overlapping windows that detect matches
+  spanning up to 16 KiB of raw input without normalising an entire large body
+  in memory. Operator patterns also inspect full raw surfaces for longer matches.
+- Route-aware probes keep indexed lookups for unknown paths. Applications that
+  change a registered route URI in place can call `refreshRouteIndex()`.
+- Shared-payload correlation evaluates every qualifying fingerprint before
+  limiting results, including groups below the first fifty candidates. It
+  reports an error if the configured row budget would make results incomplete.
+- `waf:correlate` rejects invalid or non-positive time-window options.
+- `waf:stats` rejects invalid or non-positive day windows.
+- Request surfaces are normalised and matched one chunk at a time, bounding
+  temporary scan memory while retaining detection throughout large bodies.
+- Attempt variant claims and per-IP caps now follow the same fixed windows as
+  stored rows; a failed database write releases its cache claim and counter.
+- Constrained one-segment routes now count as served probe paths. Ordinary
+  route collections keep a live keyed index for direct matches while additions,
+  replacements and explicit index refreshes stay visible.
+- Coordinated-attack correlation now uses the same keyed target hash for
+  visible and redacted findings. An upgrade migration backfills older visible
+  logs so mixed traffic to one target is counted together.
+- A new upgrade migration deactivates orphaned exclusions with glob syntax
+  that may have originated from literal paths in purged logs. Intentional
+  manual wildcard exclusions without a source log also need review afterward.
+- Route-aware probes now see routes registered after a route cache was loaded,
+  including replacements.
+- Auto-ban creation now uses an atomic cache claim, so concurrent threshold
+  crossings dispatch `IpBanned` once.
+- Manual exclusions scoped to `/` now stay on `/` instead of applying to every
+  path. An empty manual path glob still explicitly means every path.
+- A separate upgrade migration deactivates ambiguous unscoped or
+  redaction-marker exclusions whose source log was already purged. This also
+  deactivates intentional manual global exclusions on existing installations;
+  review and recreate them after upgrading.
+- `waf:doctor` now checks the `target_hash` write column. Redacted findings
+  never store a target hash with an empty `APP_KEY`, and configuration validation
+  reports the missing key.
+- Log-derived exclusions now use a keyed target hash for redacted URLs, so they can be
+  scoped safely; root findings and literal glob characters no longer broaden
+  the exclusion. The upgrade migration repairs existing exclusions with a
+  retained source log and deactivates those whose redacted path is unknown.
+- Coordinated-attack correlation groups redacted findings by target hash, avoiding
+  false campaigns across different redacted URLs. Legacy redacted rows without
+  a hash are omitted from this correlation. Existing installs need the new
+  `waf-migrations-upgrade` migration before writing new findings.
+- `waf:test` labels its block verdict as conditional on middleware inspection.
+- A sensitive finding now fully redacts its URL, evidence and User-Agent,
+  preventing later secrets and long token suffixes from being stored.
+- With `safe_fields`, filtered query and form fields retain the syntax needed
+  by parameter-based rules such as remote file inclusion detection.
+- `rule_ids` is a text column on fresh installs; a new upgrade migration widens
+  existing columns, and `waf:doctor` reports installations still using varchar.
+- Manual exclusions created through `ExclusionRuleService::add()` refresh the
+  active-rule cache immediately; direct database edits require `refresh()`.
+- Secret redaction uses the inspector's escape decoding for JavaScript, IIS and
+  HTML-entity encoded credentials before a finding is stored.
+- Finding and block-event deduplication distinguishes complete rule sets and
+  accepted findings, so a new attack is not hidden behind an excluded one.
+- Accepting a logged false positive now creates exclusions for every recorded
+  rule and signal, including scanner, bot and flood signals on new findings.
+- Attempt recording stops claiming variant cache keys after the per-IP cap.
+- Auto-banned clients are refused on skipped paths; the IP whitelist still wins.
+- `waf:test` now uses the real block decision, including minimum confidence,
+  exclusions and the optional flood block setting.
+- An exclusion now releases a request only when every matched rule and signal
+  is accepted; a second attack can no longer ride along with a false positive.
+  Existing single-rule exclusions may need companion rules when one payload
+  matches several signatures.
+- Secret redaction now masks values revealed by layered URL decoding before
+  storing the finding, including partially double-encoded credentials.
+- Blocklist export excludes accepted false positives and streams rows instead
+  of holding every IP in memory.
+- Disabled scanner, bot and flood rules or categories now suppress their
+  corresponding signals, including flood counting.
+- The additive WAF log upgrade migration leaves columns and data intact on
+  rollback because it cannot know whether it created them. Previously published
+  copies of the migration need to be updated separately.
+- Attempt recording reuses a successful table check within each worker rather
+  than querying the schema for every detected request.
+- `waf:test --json` now builds the same parsed JSON request as web traffic, so
+  `safe_fields` behaves consistently in dry runs.
+- Large blog and API requests are no longer blocked solely for exceeding an
+  inspection threshold. The WAF inspects overlapping chunks across the body.
+- Queued and concurrent first-hit duplicates now contribute to `hit_count`.
+- Coordinated-attack correlation aggregates and limits targets in the database,
+  keeping application memory bounded when many URLs are logged.
+- Laravel `model:prune` now clears the source log reference of retained
+  exclusion rules when it removes an old finding.
+- Inline duplicate findings now update `hit_count` immediately; the cache-only
+  flush interval could permanently lose the end of a burst. The
+  `dedup_flush_seconds` setting has been removed.
+- `waf:export --limit` now skips malformed IPs before counting exported rows.
+- IP risk ranking scores every candidate before applying its result limit.
+- Coordinated-attack detection groups the same host and path across different
+  query strings.
+- Exclusion-rule documentation now describes the exact-label matching used
+  by the code.
+- Oversized request surfaces now produce a decisive finding, so an uninspected
+  middle section cannot pass as clean in blocking mode.
+- Purging old findings keeps standing exclusion rules and clears their source
+  log reference instead of deleting the rules.
+- `waf:doctor` now exits with failure for invalid WAF configuration.
+- A queued finding that ultimately fails to write releases its deduplication
+  slot, allowing a later identical attempt to be recorded.
+- `waf:export` rejects invalid numeric filters before generating a blocklist.
+- `waf:export` now omits malformed IP addresses from generated blocklists,
+  including shell-ready fail2ban commands.
+- Invalid retention values can no longer cause `waf:purge`, scheduled purges or
+  `model:prune` to delete findings prematurely; `waf:doctor` reports the typo.
+- Cache outages now disable only cache-backed signals temporarily: signature
+  inspection, finding storage and blocking continue, with a single diagnostic
+  warning per worker. Exclusion rules fall back to a direct database read.
+  Findings also remain writable with the `null` cache driver or
+  `dedup_minutes=0`.
+- Failing application event listeners no longer interrupt a recorded finding,
+  a block response or an auto-ban. Auth-guard failures no longer discard a
+  finding just because its user ID could not be read.
+- Conflicting forwarded IP headers now fall back to the connection address,
+  keeping allow/deny decisions, flood counting and finding storage operational.
+- A failed queue dispatch falls back to a direct finding write. Diagnostic log
+  failures no longer interrupt inspection, blocking or storage.
+- Detection repeats bounded decoding passes so one encoding type can reveal
+  another (for example, a backslash escape that yields percent-encoded XSS).
+- Sensitive parameter names are masked in stored URLs and evidence even when
+  another rule triggered the finding; log text is normalised to valid UTF-8
+  with control and bidirectional formatting characters made visible.
+- `only_paths` now matches percent-encoded spellings of protected paths, so
+  encoding a route segment cannot skip inspection. `skip_paths` still checks
+  only the raw path.
+- PCRE evaluation failures are now logged once per rule and no longer silently
+  count as a clean match. Other rules keep scanning in fail-open mode; fail-closed
+  mode returns the configured 503 response.
 - Requests to `/_ignition/execute-solution` (CVE-2021-3129) now reach decisive
   confidence and are blocked when the WAF runs globally in blocking mode.
 

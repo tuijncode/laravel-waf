@@ -133,16 +133,14 @@ return [
     | attack aimed at many endpoints collapses to one finding. Enable this to
     | add the path to the key (one finding per path), which keeps the breadth
     | of a sweep visible to the correlation analytics at the cost of more rows.
-    | dedup_flush_seconds — a duplicate bumps the finding's `hit_count` instead
-    | of being dropped. To keep that off the database on a route under attack,
-    | the bumps are accumulated in the cache and written back at most once per
-    | this many seconds (so the count is eventually consistent). Set to 0 to
-    | write every bump straight through (exact, but one UPDATE per duplicate).
+    | A duplicate bumps the finding's `hit_count` instead of being dropped.
+    | With queued storage, later bumps are grouped into a delayed queue job
+    | and recorded by individual durable hit jobs (waf_hit_events and
+    | waf_hit_totals migrations).
     |
     */
     'dedup_minutes' => env('WAF_DEDUP_MINUTES', 5),
     'dedup_include_path' => env('WAF_DEDUP_INCLUDE_PATH', false),
-    'dedup_flush_seconds' => env('WAF_DEDUP_FLUSH_SECONDS', 10),
 
     /*
     |--------------------------------------------------------------------------
@@ -150,9 +148,10 @@ return [
     |--------------------------------------------------------------------------
     |
     | The WAF detects secrets (API keys, passwords, tokens, card numbers). To
-    | avoid storing them verbatim in `waf_logs`, the captured value of any
-    | finding whose label matches one of `labels` is masked before it is
-    | written to the URL and payload columns.
+    | avoid storing them verbatim in `waf_logs`, URL, payload and User-Agent
+    | are fully redacted when a sensitive rule matches. Named credential values
+    | are masked on other findings. The field-name defaults live in Redactor
+    | so older published config files get them too.
     |
     */
     'redact' => [
@@ -169,6 +168,7 @@ return [
     |--------------------------------------------------------------------------
     |
     | only_paths — if non-empty, ONLY these (wildcard) paths are inspected.
+    |              Both raw and percent-decoded paths are matched.
     | skip_paths — paths excluded from inspection (assets, health checks …).
     |
     | NOTE: Livewire's asset routes are skipped, but its update endpoint
@@ -314,7 +314,7 @@ return [
     |       'label'     => 'My Label',
     |       'severity'  => 'critical',                         // critical|error|warning|notice
     |       'targets'   => ['query', 'body', 'path', 'headers', 'cookie'],
-    |       'validator' => 'luhn',                             // optional post-match check
+    |       'validator' => 'luhn',                             // too many rejected candidates follow on_error
     |   ],
     |
     | Invalid patterns are logged once and skipped. Matches are stored under the
@@ -339,6 +339,99 @@ return [
     |
     */
     'pattern_pack' => env('WAF_PATTERN_PACK', true),
+
+    /*
+    | AI infrastructure probe paths. Off by default because applications may
+    | legitimately serve these endpoints. Matching application routes are
+    | exempt, including routes registered under another HTTP method.
+    */
+    'ai_probes' => [
+        'enabled' => env('WAF_AI_PROBES', false),
+        'paths' => [
+            '/api/tags' => 'Ollama Model Enumeration',
+            '/api/ps' => 'Ollama Running Models',
+            '/api/show' => 'Ollama Model Details',
+            '/api/version' => 'Ollama Version Probe',
+            '/api/pull' => 'Ollama Model Pull',
+            '/api/push' => 'Ollama Model Push',
+            '/api/create' => 'Ollama Model Create',
+            '/api/copy' => 'Ollama Model Copy',
+            '/api/delete' => 'Ollama Model Delete',
+            '/api/generate' => 'Ollama Inference Probe',
+            '/api/chat' => 'Ollama Inference Probe',
+            '/api/embed' => 'Ollama Embedding Probe',
+            '/api/embeddings' => 'Ollama Embedding Probe',
+            '/v1/models' => 'Model API Enumeration',
+            '/v1/chat/completions' => 'Model API Inference Probe',
+            '/v1/completions' => 'Model API Inference Probe',
+            '/v1/embeddings' => 'Model API Embedding Probe',
+            '/v1/responses' => 'Model API Response Probe',
+            '/v1/messages' => 'Anthropic-Compatible Messages Probe',
+            '/v1beta/models' => 'Gemini Model Enumeration',
+            '/v1beta/models/*' => 'Gemini Inference Probe',
+            '/mcp' => 'MCP Server Probe',
+            '/mcp/*' => 'MCP Server Probe',
+            '/.cursor/rules' => 'Agent Rules File Probe',
+            '/.cursor/*' => 'Agent Config Probe',
+            '/.aider.conf.yml' => 'Agent Config Probe',
+            '/.continue/*' => 'Agent Config Probe',
+            '/AGENTS.md' => 'Agent Instructions Probe',
+            '/CLAUDE.md' => 'Agent Instructions Probe',
+            '/api/v1/validate/code' => 'Langflow Code Validation Probe',
+            '/api/kernels/*' => 'Notebook Kernel Probe',
+            '/lsp/*' => 'marimo LSP Probe',
+            '/@file/*' => 'marimo File Access Probe',
+            '/litellm/*' => 'LiteLLM Admin Probe',
+            '/key/generate' => 'LiteLLM Key Generation Probe',
+            '/ollama/*' => 'Open WebUI Ollama Proxy Probe',
+            '/rag/api/*' => 'Open WebUI RAG Probe',
+        ],
+    ],
+
+    /*
+    | Optional probes for paths from other application stacks. Only unknown
+    | paths are reported; routes actually served by the application are exempt.
+    */
+    'probe_paths' => [
+        'enabled' => env('WAF_PROBE_PATHS', false),
+        'paths' => [
+            '/wp-content/*' => 'WordPress Content Probe',
+            '/wp-includes/*' => 'WordPress Includes Probe',
+            '/wp-cron.php' => 'WordPress Cron Probe',
+            '/administrator' => 'CMS Admin Probe',
+            '/administrator/*' => 'CMS Admin Probe',
+            '/cpanel' => 'cPanel Probe',
+            '/cgi-bin/*' => 'CGI Bin Probe',
+            '/swagger' => 'Swagger UI Probe',
+            '/swagger/*' => 'Swagger UI Probe',
+            '/api-docs' => 'API Docs Probe',
+            '/api-docs/*' => 'API Docs Probe',
+            '/backup' => 'Backup Directory Probe',
+            '/backup/*' => 'Backup Directory Probe',
+            '/*.asp' => 'ASP Probe',
+            '/*.aspx' => 'ASPX Probe',
+            '/*.jsp' => 'JSP Probe',
+        ],
+    ],
+
+    /* Detect instructions aimed at an AI application or AI-assisted log triage. */
+    'llm_injection' => [
+        'enabled' => env('WAF_LLM_INJECTION', false),
+    ],
+
+    /*
+    | Optional attempt-level hashes, recorded before finding deduplication.
+    | Requires the create_waf_attempts_table migration. No payload text is
+    | stored; per-IP writes are capped and old rows are removed by waf:purge.
+    */
+    'attempts' => [
+        'enabled' => env('WAF_ATTEMPTS', false),
+        'table' => 'waf_attempts',
+        'window_minutes' => 60,
+        'max_per_ip' => 200,
+        'max_correlation_rows' => 10000,
+        'retention_days' => 7,
+    ],
 
     'custom_pattern_severity' => env('WAF_CUSTOM_SEVERITY', 'error'),
     'custom_pattern_paranoia' => env('WAF_CUSTOM_PARANOIA', 1),
