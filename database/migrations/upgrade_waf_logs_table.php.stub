@@ -45,27 +45,6 @@ return new class extends Migration
 
     public function down(): void
     {
-        $table = config('waf.table_name', 'waf_logs');
-
-        if (Schema::hasColumn($table, 'event_id')) {
-            Schema::table($table, function (Blueprint $table) {
-                $table->dropUnique(['event_id']);
-                $table->dropColumn('event_id');
-            });
-        }
-
-        if (Schema::hasColumn($table, 'hit_count')) {
-            Schema::table($table, function (Blueprint $table) {
-                $table->dropColumn('hit_count');
-            });
-        }
-
-        try {
-            Schema::table($table, function (Blueprint $table) {
-                $table->dropIndex(['created_at']);
-            });
-        } catch (\Throwable) {
-            // Index absent — nothing to do.
-        }
+        // up() may have found these columns already present, so rollback cannot safely remove them.
     }
 };

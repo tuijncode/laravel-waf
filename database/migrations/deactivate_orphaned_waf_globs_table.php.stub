@@ -1,0 +1,36 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Tuijncode\LaravelWaf\Services\ExclusionRuleService;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (! Schema::hasTable('waf_exclusion_rules')) {
+            return;
+        }
+
+        // Old literal paths containing glob syntax cannot be distinguished
+        // from manual wildcard rules once their source log has been purged.
+        foreach (DB::table('waf_exclusion_rules')
+            ->where('is_active', true)
+            ->whereNull('source_log_id')
+            ->whereNotNull('path_glob')
+            ->select('id', 'path_glob')
+            ->lazyById(100) as $rule) {
+            if (strpbrk($rule->path_glob, '*?[]\\') !== false) {
+                DB::table('waf_exclusion_rules')->where('id', $rule->id)->update(['is_active' => false]);
+            }
+        }
+
+        app(ExclusionRuleService::class)->refresh();
+    }
+
+    public function down(): void
+    {
+        // The original scope of these exclusions is unknown.
+    }
+};

@@ -1,0 +1,31 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        $table = config('waf.table_name', 'waf_logs');
+
+        if (! Schema::hasTable($table) || ! Schema::hasColumn($table, 'rule_ids')) {
+            return;
+        }
+
+        $type = strtolower(Schema::getColumnType($table, 'rule_ids', true));
+        if (str_contains($type, 'text') || str_contains($type, 'max')) {
+            return;
+        }
+
+        Schema::table($table, function (Blueprint $blueprint) {
+            $blueprint->text('rule_ids')->nullable()->change();
+        });
+    }
+
+    public function down(): void
+    {
+        // Existing rule lists may exceed 255 characters; narrowing would lose data.
+    }
+};

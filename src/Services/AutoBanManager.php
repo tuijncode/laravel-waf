@@ -5,6 +5,8 @@ namespace Tuijncode\LaravelWaf\Services;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\RateLimiter;
 use Tuijncode\LaravelWaf\Events\IpBanned;
+use Tuijncode\LaravelWaf\Support\CacheFailure;
+use Tuijncode\LaravelWaf\Support\QuietEvent;
 
 /**
  * Temporary, cache-based IP bans (blocking mode only).
@@ -25,7 +27,17 @@ class AutoBanManager
 
     public function banned(string $ip): bool
     {
-        return $this->enabled() && Cache::has($this->key($ip));
+        if (! $this->enabled()) {
+            return false;
+        }
+
+        try {
+            return Cache::has($this->key($ip));
+        } catch (\Throwable $e) {
+            CacheFailure::report($e);
+
+            return false;
+        }
     }
 
     /**
@@ -39,23 +51,22 @@ class AutoBanManager
             return;
         }
 
-        $strikes = RateLimiter::hit(
-            'laravel-waf|strikes|'.sha1($ip),
-            (int) config('waf.auto_ban.window', 300),
-        );
+        try {
+            $strikes = RateLimiter::hit(
+                'laravel-waf|strikes|'.sha1($ip),
+                (int) config('waf.auto_ban.window', 300),
+            );
 
-        if ($strikes < (int) config('waf.auto_ban.max_blocks', 5)) {
-            return;
-        }
+            if ($strikes < (int) config('waf.auto_ban.max_blocks', 5)) {
+                return;
+            }
 
-        // A ban is already standing while the strikes keep coming; only announce
-        // the transition from un-banned to banned.
-        $fresh = ! Cache::has($this->key($ip));
-
-        Cache::put($this->key($ip), true, $this->duration());
-
-        if ($fresh) {
-            IpBanned::dispatch($ip, $this->duration());
+            // Only the worker that creates the ban announces it.
+            if (Cache::add($this->key($ip), true, $this->duration())) {
+                QuietEvent::dispatch(new IpBanned($ip, $this->duration()));
+            }
+        } catch (\Throwable $e) {
+            CacheFailure::report($e);
         }
     }
 

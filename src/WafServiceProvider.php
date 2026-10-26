@@ -5,7 +5,6 @@ namespace Tuijncode\LaravelWaf;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Routing\Router;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\ServiceProvider;
 use Tuijncode\LaravelWaf\Console\Commands\PurgeWafLogsCommand;
 use Tuijncode\LaravelWaf\Console\Commands\WafCorrelateCommand;
@@ -15,6 +14,7 @@ use Tuijncode\LaravelWaf\Console\Commands\WafStatsCommand;
 use Tuijncode\LaravelWaf\Console\Commands\WafTestCommand;
 use Tuijncode\LaravelWaf\Console\Commands\WafUnbanCommand;
 use Tuijncode\LaravelWaf\Http\Middleware\WafMiddleware;
+use Tuijncode\LaravelWaf\Services\AttemptRecorder;
 use Tuijncode\LaravelWaf\Services\AutoBanManager;
 use Tuijncode\LaravelWaf\Services\BotDetector;
 use Tuijncode\LaravelWaf\Services\ConfidenceScorer;
@@ -25,6 +25,7 @@ use Tuijncode\LaravelWaf\Services\Redactor;
 use Tuijncode\LaravelWaf\Services\ScannerDetector;
 use Tuijncode\LaravelWaf\Services\WafInspector;
 use Tuijncode\LaravelWaf\Support\ConfigValidator;
+use Tuijncode\LaravelWaf\Support\QuietLog;
 
 class WafServiceProvider extends ServiceProvider
 {
@@ -40,6 +41,7 @@ class WafServiceProvider extends ServiceProvider
         $this->app->singleton(ExclusionRuleService::class, fn () => new ExclusionRuleService);
         $this->app->singleton(Redactor::class, fn () => new Redactor);
         $this->app->singleton(AutoBanManager::class, fn () => new AutoBanManager);
+        $this->app->singleton(AttemptRecorder::class, fn () => new AttemptRecorder);
         $this->app->singleton(CorrelationAnalyzer::class, fn () => new CorrelationAnalyzer);
 
         $this->app->singleton('laravel-waf', function ($app) {
@@ -50,6 +52,7 @@ class WafServiceProvider extends ServiceProvider
                 $app->make(DdosMonitor::class),
                 $app->make(ExclusionRuleService::class),
                 $app->make(Redactor::class),
+                $app->make(AttemptRecorder::class),
             );
         });
 
@@ -90,7 +93,7 @@ class WafServiceProvider extends ServiceProvider
         }
 
         foreach ($problems as $problem) {
-            Log::warning('laravel-waf: '.$problem);
+            QuietLog::write('warning', 'laravel-waf: '.$problem);
         }
     }
 
@@ -113,13 +116,31 @@ class WafServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__.'/../database/migrations/create_waf_logs_table.php.stub' => $this->migrationPath('create_waf_logs_table'),
             __DIR__.'/../database/migrations/create_waf_exclusion_rules_table.php.stub' => $this->migrationPath('create_waf_exclusion_rules_table', 1),
+            __DIR__.'/../database/migrations/create_waf_attempts_table.php.stub' => $this->migrationPath('create_waf_attempts_table', 3),
+            __DIR__.'/../database/migrations/create_waf_hit_events_table.php.stub' => $this->migrationPath('create_waf_hit_events_table', 9),
+            __DIR__.'/../database/migrations/create_waf_hit_totals_table.php.stub' => $this->migrationPath('create_waf_hit_totals_table', 10),
+            __DIR__.'/../database/migrations/create_waf_purge_watermarks_table.php.stub' => $this->migrationPath('create_waf_purge_watermarks_table', 11),
         ], 'waf-migrations');
+
+        $this->publishes([
+            __DIR__.'/../database/migrations/create_waf_attempts_table.php.stub' => $this->migrationPath('create_waf_attempts_table', 3),
+        ], 'waf-migrations-attempts');
 
         // Upgrade migration for installs that already ran the create migrations
         // on an earlier version. Published on its own tag so a fresh install
         // (whose create migration already has these columns) isn't handed it.
         $this->publishes([
             __DIR__.'/../database/migrations/upgrade_waf_logs_table.php.stub' => $this->migrationPath('upgrade_waf_logs_table', 2),
+            __DIR__.'/../database/migrations/widen_waf_rule_ids_table.php.stub' => $this->migrationPath('widen_waf_rule_ids_table', 4),
+            __DIR__.'/../database/migrations/add_waf_target_hash_table.php.stub' => $this->migrationPath('add_waf_target_hash_table', 5),
+            __DIR__.'/../database/migrations/deactivate_orphaned_waf_exclusions_table.php.stub' => $this->migrationPath('deactivate_orphaned_waf_exclusions_table', 6),
+            __DIR__.'/../database/migrations/backfill_waf_target_hash_table.php.stub' => $this->migrationPath('backfill_waf_target_hash_table', 7),
+            __DIR__.'/../database/migrations/deactivate_orphaned_waf_globs_table.php.stub' => $this->migrationPath('deactivate_orphaned_waf_globs_table', 8),
+            __DIR__.'/../database/migrations/create_waf_hit_events_table.php.stub' => $this->migrationPath('create_waf_hit_events_table', 9),
+            __DIR__.'/../database/migrations/create_waf_hit_totals_table.php.stub' => $this->migrationPath('create_waf_hit_totals_table', 10),
+            __DIR__.'/../database/migrations/create_waf_purge_watermarks_table.php.stub' => $this->migrationPath('create_waf_purge_watermarks_table', 11),
+            __DIR__.'/../database/migrations/widen_waf_user_id_table.php.stub' => $this->migrationPath('widen_waf_user_id_table', 12),
+            __DIR__.'/../database/migrations/widen_waf_exclusion_user_id_table.php.stub' => $this->migrationPath('widen_waf_exclusion_user_id_table', 13),
         ], 'waf-migrations-upgrade');
     }
 
@@ -173,7 +194,10 @@ class WafServiceProvider extends ServiceProvider
                 return;
             }
 
-            $days = (int) config('waf.retention.days', 90);
+            $days = filter_var(config('waf.retention.days', 90), FILTER_VALIDATE_INT);
+            if ($days === false || $days < 1) {
+                return;
+            }
 
             $this->app->make(Schedule::class)
                 ->command("waf:purge --days={$days}")

@@ -48,3 +48,36 @@ it('still detects an attack buried in a large payload', function () use ($browse
 
     expect(Waf::inspect($request)->ruleIds())->toContain('942100');
 });
+
+it('bounds work from a broad Luhn pattern without inventing an attack', function () {
+    config()->set('waf.pattern_pack', false);
+    config()->set('waf.custom_patterns', [
+        '/0/' => ['label' => 'Digits', 'targets' => ['body'], 'validator' => 'luhn'],
+    ]);
+    $request = Request::create('/', 'POST', [], [], [], [], str_repeat('0', 5000000));
+
+    $result = Waf::inspect($request);
+    expect($result->ruleIds())->not->toContain('CUSTOM-1');
+    expect($result->confidenceScore())->toBe(0);
+});
+
+it('lets a clean request through when a broad validator exceeds its limit', function () {
+    config()->set('waf.pattern_pack', false);
+    config()->set('waf.mode', 'blocking');
+    config()->set('waf.custom_patterns', [
+        '/0/' => ['label' => 'Digits', 'targets' => ['body'], 'validator' => 'luhn'],
+    ]);
+
+    $this->post('/', ['value' => str_repeat('0', 30000)])->assertOk();
+});
+
+it('uses the configured fail-closed response when a validator exceeds its limit', function () {
+    config()->set('waf.pattern_pack', false);
+    config()->set('waf.mode', 'blocking');
+    config()->set('waf.on_error', 'closed');
+    config()->set('waf.custom_patterns', [
+        '/0/' => ['label' => 'Digits', 'targets' => ['body'], 'validator' => 'luhn'],
+    ]);
+
+    $this->post('/', ['value' => str_repeat('0', 30000)])->assertStatus(503);
+});

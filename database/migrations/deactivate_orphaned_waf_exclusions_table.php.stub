@@ -1,0 +1,35 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Tuijncode\LaravelWaf\Services\ExclusionRuleService;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (! Schema::hasTable('waf_exclusion_rules')) {
+            return;
+        }
+
+        // Source logs were purged before their path could be reconstructed.
+        // These rows also include indistinguishable manual global exclusions.
+        DB::table('waf_exclusion_rules')
+            ->where('is_active', true)
+            ->whereNull('source_log_id')
+            ->where(function ($query): void {
+                $query->whereNull('path_glob')
+                    ->orWhere('path_glob', '')
+                    ->orWhere('path_glob', '[REDACTED]');
+            })
+            ->update(['is_active' => false]);
+
+        app(ExclusionRuleService::class)->refresh();
+    }
+
+    public function down(): void
+    {
+        // It is unsafe to reactivate exclusions whose original scope is unknown.
+    }
+};

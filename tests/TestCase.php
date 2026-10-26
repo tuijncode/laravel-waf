@@ -14,8 +14,22 @@ abstract class TestCase extends Orchestra
     {
         parent::setUp();
 
+        if (in_array(getenv('WAF_TEST_DB_DRIVER'), ['mysql', 'pgsql'], true)) {
+            $database = (string) config('database.connections.testing.database');
+            if (getenv('WAF_TEST_RESET_DB') !== '1' || ! str_ends_with($database, '_test')) {
+                throw new \RuntimeException('WAF database tests require WAF_TEST_RESET_DB=1 and a dedicated database ending in _test.');
+            }
+            foreach (['waf_hit_events', 'waf_hit_totals', 'waf_purge_watermarks', 'waf_exclusion_rules', 'waf_attempts', 'waf_logs'] as $table) {
+                Schema::dropIfExists($table);
+            }
+        }
+
         $this->createWafLogsTable();
         $this->createWafExclusionRulesTable();
+        $this->createWafAttemptsTable();
+        (require __DIR__.'/../database/migrations/create_waf_hit_events_table.php.stub')->up();
+        (require __DIR__.'/../database/migrations/create_waf_hit_totals_table.php.stub')->up();
+        (require __DIR__.'/../database/migrations/create_waf_purge_watermarks_table.php.stub')->up();
 
         // A catch-all route guarded by the WAF middleware so feature tests can
         // fire attack payloads at any path.
@@ -30,14 +44,26 @@ abstract class TestCase extends Orchestra
     protected function defineEnvironment($app): void
     {
         $app['config']->set('database.default', 'testing');
-        $app['config']->set('database.connections.testing', [
-            'driver' => 'sqlite',
-            'database' => ':memory:',
-            'prefix' => '',
-        ]);
+        $driver = getenv('WAF_TEST_DB_DRIVER');
+        $app['config']->set('database.connections.testing', $driver === 'mysql' || $driver === 'pgsql'
+            ? [
+                'driver' => $driver,
+                'host' => getenv('WAF_TEST_DB_HOST') ?: '127.0.0.1',
+                'port' => getenv('WAF_TEST_DB_PORT') ?: ($driver === 'mysql' ? 3306 : 5432),
+                'database' => getenv('WAF_TEST_DB_NAME') ?: 'waf_test',
+                'username' => getenv('WAF_TEST_DB_USER') ?: 'waf_test',
+                'password' => getenv('WAF_TEST_DB_PASSWORD') ?: 'waf_test',
+                'prefix' => '',
+            ]
+            : [
+                'driver' => 'sqlite',
+                'database' => ':memory:',
+                'prefix' => '',
+            ]);
 
         // The array cache supports atomic increments (needed by DDoS + dedup).
         $app['config']->set('cache.default', 'array');
+        $app['config']->set('app.key', '0123456789abcdef0123456789abcdef');
 
         $app['config']->set('waf.enabled', true);
         $app['config']->set('waf.enabled_environments', null);
@@ -55,10 +81,11 @@ abstract class TestCase extends Orchestra
             $table->string('ip_address')->index();
             $table->string('method', 10)->nullable();
             $table->text('url');
+            $table->string('target_hash', 64)->nullable()->index();
             $table->string('user_agent', 500)->nullable();
             $table->text('type');
             $table->string('category', 30)->index();
-            $table->string('rule_ids')->nullable();
+            $table->text('rule_ids')->nullable();
             $table->text('payload')->nullable();
             $table->string('threat_level', 20)->default('notice')->index();
             $table->unsignedSmallInteger('anomaly_score')->default(0);
@@ -66,7 +93,7 @@ abstract class TestCase extends Orchestra
             $table->string('confidence_label', 20)->default('none');
             $table->string('action_taken', 20)->default('logged');
             $table->unsignedInteger('hit_count')->default(1);
-            $table->unsignedBigInteger('user_id')->nullable()->index();
+            $table->string('user_id', 191)->nullable()->index();
             $table->timestamps();
             $table->index('created_at');
         });
@@ -79,10 +106,16 @@ abstract class TestCase extends Orchestra
             $table->string('match_label');
             $table->string('path_glob')->nullable();
             $table->unsignedBigInteger('source_log_id')->nullable();
-            $table->unsignedBigInteger('created_by_user_id')->nullable();
+            $table->string('created_by_user_id', 191)->nullable();
             $table->text('reason')->nullable();
             $table->boolean('is_active')->default(true)->index();
             $table->timestamps();
         });
+    }
+
+    protected function createWafAttemptsTable(): void
+    {
+        $migration = require __DIR__.'/../database/migrations/create_waf_attempts_table.php.stub';
+        $migration->up();
     }
 }

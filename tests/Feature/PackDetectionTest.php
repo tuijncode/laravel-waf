@@ -1,6 +1,8 @@
 <?php
 
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Tuijncode\LaravelWaf\Facades\Waf;
 
 it('detects bundled pack signatures end to end', function (string $query, string $label) {
     $this->get('/?'.$query)->assertOk();
@@ -56,4 +58,50 @@ it('ignores a 16-digit number that fails the Luhn check', function () {
     $this->post('/', ['order' => '4111111111111112'])->assertOk();
 
     expect(DB::table('waf_logs')->count())->toBe(0);
+});
+
+it('detects a bundled reverse-shell pattern across an old chunk boundary', function () {
+    $body = str_repeat('a', 13500)."\nmkfifo /tmp/pipe; cat /tmp/pipe ".str_repeat('a', 4500).'| sh';
+    $result = Waf::inspect(Request::create('/', 'POST', [], [], [], [], $body));
+
+    expect(collect($result->matches)->contains(fn ($match): bool => $match->description === 'Reverse Shell'))
+        ->toBeTrue();
+});
+
+it('detects a FIFO command with a distant pipe', function () {
+    $body = str_repeat('a', 23000)."\nmkfifo p; cat p ".str_repeat('a', 18000).'| sh';
+    $result = Waf::inspect(Request::create('/', 'POST', [], [], [], [], $body));
+
+    expect(collect($result->matches)->contains(fn ($match): bool => $match->description === 'Reverse Shell'))
+        ->toBeTrue();
+});
+
+it('does not treat a prose mention of mkfifo as a reverse shell', function () {
+    $result = Waf::inspect(Request::create('/', 'POST', [], [], [], [], 'The mkfifo utility creates named pipes.'));
+
+    expect(collect($result->matches)->contains(fn ($match): bool => $match->description === 'Reverse Shell'))
+        ->toBeFalse();
+});
+
+it('does not treat a prose mention of mkfifo followed by a table as a reverse shell', function () {
+    $body = 'The mkfifo utility creates named pipes. | Next column';
+    $result = Waf::inspect(Request::create('/', 'POST', [], [], [], [], $body));
+
+    expect(collect($result->matches)->contains(fn ($match): bool => $match->description === 'Reverse Shell'))
+        ->toBeFalse();
+});
+
+it('does not treat a query value with mkfifo prose and a table as a reverse shell', function () {
+    $request = Request::create('/?q='.rawurlencode('mkfifo utility creates named pipes. | Next column'));
+    $result = Waf::inspect($request);
+
+    expect(collect($result->matches)->contains(fn ($match): bool => $match->description === 'Reverse Shell'))
+        ->toBeFalse();
+});
+
+it('keeps detecting relative FIFO paths with a nearby pipe', function () {
+    $result = Waf::inspect(Request::create('/', 'POST', [], [], [], [], 'mkfifo p; cat p | sh'));
+
+    expect(collect($result->matches)->contains(fn ($match): bool => $match->description === 'Reverse Shell'))
+        ->toBeTrue();
 });

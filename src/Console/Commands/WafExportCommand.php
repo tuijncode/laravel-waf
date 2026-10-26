@@ -3,8 +3,8 @@
 namespace Tuijncode\LaravelWaf\Console\Commands;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\LazyCollection;
 
 /**
  * Export offending IPs from the findings table as an edge blocklist — feed the
@@ -56,25 +56,39 @@ class WafExportCommand extends Command
             return self::INVALID;
         }
 
-        $rows = $this->query($minLevel);
+        foreach (['days' => 0, 'min-hits' => 1, 'limit' => 0] as $option => $minimum) {
+            $value = filter_var($this->option($option), FILTER_VALIDATE_INT);
+            if ($value === false || $value < $minimum) {
+                $err->writeln("<error>--{$option} must be an integer of at least {$minimum}.</error>");
 
-        if ($rows->isEmpty()) {
+                return self::INVALID;
+            }
+        }
+
+        $count = 0;
+        foreach ($this->query($minLevel) as $row) {
+            if ($count === 0 && $format === 'csv') {
+                $this->line('ip_address,hits,max_level,last_seen');
+            }
+            $this->render($format, $row);
+            $count++;
+        }
+
+        if ($count === 0) {
             $err->writeln('<comment>No matching IPs.</comment>');
 
             return self::SUCCESS;
         }
 
-        $this->render($format, $rows);
-
-        $err->writeln("<info>Exported {$rows->count()} IP(s).</info>");
+        $err->writeln("<info>Exported {$count} IP(s).</info>");
 
         return self::SUCCESS;
     }
 
     /**
-     * @return Collection<int, \stdClass>
+     * @return LazyCollection<int, \stdClass>
      */
-    private function query(string $minLevel)
+    private function query(string $minLevel): LazyCollection
     {
         $table = config('waf.table_name', 'waf_logs');
         $days = max(0, (int) $this->option('days'));
@@ -86,6 +100,7 @@ class WafExportCommand extends Command
         $case = "CASE threat_level WHEN 'critical' THEN 4 WHEN 'error' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END";
 
         $query = DB::table($table)
+            ->where('action_taken', '!=', 'excluded')
             ->select(
                 'ip_address',
                 DB::raw('SUM(hit_count) as hits'),
@@ -101,42 +116,32 @@ class WafExportCommand extends Command
             $query->where('created_at', '>=', now()->subDays($days));
         }
 
-        if ($limit > 0) {
-            $query->limit($limit);
-        }
+        $rows = $query->cursor()->filter(
+            fn (object $row): bool => filter_var((string) $row->ip_address, FILTER_VALIDATE_IP) !== false
+        );
 
-        return $query->get();
+        return $limit > 0 ? $rows->take($limit) : $rows;
     }
 
-    /**
-     * @param  Collection<int, \stdClass>  $rows
-     */
-    private function render(string $format, Collection $rows): void
+    private function render(string $format, \stdClass $row): void
     {
         $labels = array_flip(self::RANKS);
         $jail = (string) $this->option('jail');
+        $ip = (string) $row->ip_address;
+        $level = $labels[(int) $row->lvl] ?? 'notice';
 
-        if ($format === 'csv') {
-            $this->line('ip_address,hits,max_level,last_seen');
-        }
-
-        foreach ($rows as $row) {
-            $ip = (string) $row->ip_address;
-            $level = $labels[(int) $row->lvl] ?? 'notice';
-
-            $this->line(match ($format) {
-                'fail2ban' => "fail2ban-client set {$jail} banip {$ip}",
-                'nginx' => "deny {$ip};",
-                'apache' => "Require not ip {$ip}",
-                'csv' => implode(',', [
-                    $this->csvCell($ip),
-                    (int) $row->hits,
-                    $this->csvCell($level),
-                    $this->csvCell((string) $row->last_seen),
-                ]),
-                default => $ip,
-            });
-        }
+        $this->line(match ($format) {
+            'fail2ban' => "fail2ban-client set {$jail} banip {$ip}",
+            'nginx' => "deny {$ip};",
+            'apache' => "Require not ip {$ip}",
+            'csv' => implode(',', [
+                $this->csvCell($ip),
+                (int) $row->hits,
+                $this->csvCell($level),
+                $this->csvCell((string) $row->last_seen),
+            ]),
+            default => $ip,
+        });
     }
 
     /**

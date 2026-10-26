@@ -8,6 +8,13 @@ it('refuses a denylisted IP, even in detection mode', function () {
     $this->get('/?q=hello')->assertForbidden();
 });
 
+it('does not enforce the denylist outside enabled environments', function () {
+    config()->set('waf.enabled_environments', ['production']);
+    config()->set('waf.blocklisted_ips', ['127.0.0.1']);
+
+    $this->get('/')->assertOk();
+});
+
 it('refuses a denylisted IP on a skip_path too', function () {
     config()->set('waf.blocklisted_ips', ['127.0.0.1']);
 

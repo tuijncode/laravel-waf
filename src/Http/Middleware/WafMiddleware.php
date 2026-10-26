@@ -5,13 +5,16 @@ namespace Tuijncode\LaravelWaf\Http\Middleware;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\IpUtils;
 use Symfony\Component\HttpFoundation\Response;
 use Tuijncode\LaravelWaf\Events\RequestBlocked;
 use Tuijncode\LaravelWaf\Services\AutoBanManager;
 use Tuijncode\LaravelWaf\Services\InspectionResult;
 use Tuijncode\LaravelWaf\Services\WafInspector;
+use Tuijncode\LaravelWaf\Support\CacheFailure;
+use Tuijncode\LaravelWaf\Support\ClientIp;
+use Tuijncode\LaravelWaf\Support\QuietEvent;
+use Tuijncode\LaravelWaf\Support\QuietLog;
 
 /**
  * Front-line WAF middleware.
@@ -33,54 +36,50 @@ class WafMiddleware
 
     public function handle(Request $request, Closure $next): Response
     {
+        if (! $this->shouldInspect($request, true)) {
+            return $next($request);
+        }
+
         // Explicit per-IP verdicts are settled before any path/mode logic, so a
         // denylisted client is refused everywhere (even on skip_paths) and a
         // whitelisted one is never touched. Allow wins over deny on overlap.
-        if (config('waf.enabled', true)) {
-            $ip = (string) $request->ip();
+        $ip = ClientIp::from($request);
 
-            if ($ip !== '' && $this->ipMatches($ip, config('waf.whitelisted_ips', []))) {
-                return $next($request);
-            }
+        if ($ip !== '' && $this->ipMatches($ip, config('waf.blocklisted_ips', []))) {
+            QuietLog::write('warning', 'laravel-waf: request refused (denylisted IP)', ['ip' => $ip]);
 
-            if ($ip !== '' && $this->ipMatches($ip, config('waf.blocklisted_ips', []))) {
-                Log::warning('laravel-waf: request refused (denylisted IP)', ['ip' => $ip]);
-
-                return $this->blockResponse($request, new InspectionResult);
-            }
-        }
-
-        if (! $this->shouldInspect($request)) {
-            return $next($request);
+            return $this->blockResponse($request, new InspectionResult);
         }
 
         try {
             // A banned client is refused before the inspection pipeline runs.
             // The ban itself was recorded when it was earned, so no per-request
             // finding or event is produced here.
-            if ($this->bans->banned((string) $request->ip())) {
+            if ($this->bans->banned(ClientIp::from($request))) {
                 return $this->blockResponse($request, new InspectionResult, [
                     'Retry-After' => (string) $this->bans->duration(),
                 ]);
             }
 
-            $result = $this->inspector->handle($request);
+            if ($this->shouldInspect($request)) {
+                $result = $this->inspector->handle($request);
 
-            if ($result !== null && $this->inspector->shouldBlock($result)) {
-                // The strike is per request so a flood earns its ban quickly...
-                $this->bans->strike((string) $request->ip());
+                if ($result !== null && $this->inspector->shouldBlock($result)) {
+                    // The strike is per request so a flood earns its ban quickly...
+                    $this->bans->strike(ClientIp::from($request));
 
-                // ...but the event is throttled to once per finding (same
-                // IP + signature + window as the log), so a flood can't drown
-                // listeners in duplicate RequestBlocked dispatches.
-                if ($this->announceBlock($request, $result)) {
-                    RequestBlocked::dispatch($request, $result);
+                    // ...but the event is throttled to once per finding (same
+                    // IP + signature + window as the log), so a flood can't drown
+                    // listeners in duplicate RequestBlocked dispatches.
+                    if ($this->announceBlock($request, $result)) {
+                        QuietEvent::dispatch(new RequestBlocked($request, $result));
+                    }
+
+                    return $this->blockResponse($request, $result);
                 }
-
-                return $this->blockResponse($request, $result);
             }
         } catch (\Throwable $e) {
-            Log::error('laravel-waf: inspection error', ['error' => $e->getMessage()]);
+            QuietLog::write('error', 'laravel-waf: inspection error', ['error' => $e->getMessage()]);
 
             // Fail open by default (the WAF must never take the application
             // down); operators running blocking mode can opt into fail-closed.
@@ -105,9 +104,24 @@ class WafMiddleware
             return true;
         }
 
-        $key = 'laravel-waf|announced|'.md5($request->ip().'#'.$result->summary());
+        $store = (string) config('cache.default');
+        if (config("cache.stores.{$store}.driver", $store) === 'null') {
+            return true;
+        }
 
-        return Cache::add($key, true, now()->addMinutes($minutes));
+        $scope = ClientIp::from($request).'#'.implode('|', $result->signatures());
+        if (config('waf.dedup_include_path', false)) {
+            $scope .= '#'.$request->path();
+        }
+        $key = 'laravel-waf|announced|'.md5($scope);
+
+        try {
+            return Cache::add($key, true, now()->addMinutes($minutes));
+        } catch (\Throwable $e) {
+            CacheFailure::report($e);
+
+            return true;
+        }
     }
 
     /**
@@ -130,8 +144,14 @@ class WafMiddleware
         }
 
         $view = config('waf.block_response.view');
-        if ($view && view()->exists($view)) {
-            return response()->view($view, ['result' => $result], $status, $headers);
+        if ($view) {
+            try {
+                if (view()->exists($view)) {
+                    return response()->view($view, ['result' => $result], $status, $headers);
+                }
+            } catch (\Throwable $e) {
+                QuietLog::write('error', 'laravel-waf: block view failed', ['error' => $e->getMessage()]);
+            }
         }
 
         return response($message, $status, $headers);
@@ -156,28 +176,32 @@ class WafMiddleware
         return $entries !== [] && IpUtils::checkIp($ip, array_values($entries));
     }
 
-    protected function shouldInspect(Request $request): bool
+    protected function shouldInspect(Request $request, bool $ignorePaths = false): bool
     {
         if (! config('waf.enabled', true)) {
             return false;
         }
 
-        $environments = config('waf.enabled_environments');
-        if (! empty($environments) && ! in_array(app()->environment(), $environments, true)) {
+        $environments = array_filter((array) config('waf.enabled_environments'), 'is_string');
+        if ($environments !== [] && ! in_array(app()->environment(), $environments, true)) {
             return false;
         }
 
-        $ip = (string) $request->ip();
+        $ip = ClientIp::from($request);
         if ($ip !== '' && $this->ipMatches($ip, config('waf.whitelisted_ips', []))) {
             return false;
         }
 
+        if ($ignorePaths) {
+            return true;
+        }
+
         $path = ltrim($request->path(), '/');
 
-        $only = config('waf.only_paths', []);
-        if (! empty($only)) {
+        $only = array_filter((array) config('waf.only_paths', []), 'is_string');
+        if ($only !== []) {
             foreach ($only as $pattern) {
-                if (fnmatch($pattern, $path)) {
+                if (fnmatch($pattern, $path) || fnmatch($pattern, rawurldecode($path))) {
                     return true;
                 }
             }
@@ -185,7 +209,7 @@ class WafMiddleware
             return false;
         }
 
-        foreach (config('waf.skip_paths', []) as $pattern) {
+        foreach (array_filter((array) config('waf.skip_paths', []), 'is_string') as $pattern) {
             if (fnmatch($pattern, $path)) {
                 return false;
             }

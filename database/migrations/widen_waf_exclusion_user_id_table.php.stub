@@ -1,0 +1,29 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Tuijncode\LaravelWaf\Support\UserIdColumnType;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        if (! Schema::hasTable('waf_exclusion_rules') || ! Schema::hasColumn('waf_exclusion_rules', 'created_by_user_id')) {
+            return;
+        }
+
+        if (UserIdColumnType::acceptsStrings(Schema::getColumnType('waf_exclusion_rules', 'created_by_user_id', true))) {
+            return;
+        }
+
+        Schema::table('waf_exclusion_rules', function (Blueprint $table): void {
+            $table->string('created_by_user_id', 191)->nullable()->change();
+        });
+    }
+
+    public function down(): void
+    {
+        // Narrowing the column would discard nonnumeric user IDs.
+    }
+};

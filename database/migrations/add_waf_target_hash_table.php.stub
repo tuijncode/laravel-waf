@@ -1,0 +1,56 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Tuijncode\LaravelWaf\Services\ExclusionRuleService;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        $table = config('waf.table_name', 'waf_logs');
+        if (Schema::hasColumn($table, 'target_hash')) {
+            return;
+        }
+
+        // Earlier log-derived exclusions treated root as every path and used
+        // redaction markers as glob syntax. Repair those with a retained source.
+        if (Schema::hasTable('waf_exclusion_rules')) {
+            $rules = DB::table('waf_exclusion_rules as rules')
+                ->join($table.' as logs', 'logs.id', '=', 'rules.source_log_id')
+                ->where('rules.is_active', true)
+                ->select('rules.id', 'rules.path_glob', 'logs.url')
+                ->lazyById(100, 'rules.id', 'id');
+
+            foreach ($rules as $rule) {
+                if (str_starts_with((string) $rule->path_glob, 'sha256:')) {
+                    continue;
+                }
+
+                if ($rule->url === '[REDACTED]') {
+                    DB::table('waf_exclusion_rules')->where('id', $rule->id)->update(['is_active' => false]);
+
+                    continue;
+                }
+
+                $path = addcslashes(trim((string) parse_url($rule->url, PHP_URL_PATH), '/'), '*?[]\\') ?: '/';
+                DB::table('waf_exclusion_rules')->where('id', $rule->id)->update(
+                    strlen($path) <= 255 ? ['path_glob' => $path] : ['is_active' => false]
+                );
+            }
+
+            app(ExclusionRuleService::class)->refresh();
+        }
+
+        Schema::table($table, function (Blueprint $table) {
+            $table->string('target_hash', 64)->nullable()->index();
+        });
+    }
+
+    public function down(): void
+    {
+        // Existing installs may already have this column; never discard its data.
+    }
+};

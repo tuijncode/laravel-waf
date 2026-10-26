@@ -4,10 +4,13 @@ namespace Tuijncode\LaravelWaf\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Http\Kernel as HttpKernel;
+use Illuminate\Http\Middleware\TrustProxies;
 use Illuminate\Routing\Router;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Schema;
 use Tuijncode\LaravelWaf\Http\Middleware\WafMiddleware;
 use Tuijncode\LaravelWaf\Support\ConfigValidator;
+use Tuijncode\LaravelWaf\Support\UserIdColumnType;
 
 /**
  * Checks that the WAF is actually working, not merely installed.
@@ -30,7 +33,7 @@ class WafDoctorCommand extends Command
 
     /** Columns the finding writer inserts. Missing any one discards every finding. */
     private const WRITE_COLUMNS = [
-        'event_id', 'ip_address', 'method', 'url', 'user_agent', 'type',
+        'event_id', 'ip_address', 'method', 'url', 'target_hash', 'user_agent', 'type',
         'category', 'rule_ids', 'payload', 'threat_level', 'anomaly_score',
         'confidence_score', 'confidence_label', 'action_taken', 'hit_count',
         'user_id', 'created_at', 'updated_at',
@@ -53,8 +56,13 @@ class WafDoctorCommand extends Command
         $this->checkEnabled();
         $this->checkConfigSanity();
         $this->checkWriteSchema();
+        $this->checkPurgeWatermark();
+        $this->checkHitTable();
+        $this->checkAttemptTable();
         $this->checkExclusionTable();
         $this->checkMiddleware();
+        $this->checkProxyTrust();
+        $this->checkAttemptRetention();
         $this->checkConfigDrift();
         $this->checkCacheDriver();
 
@@ -101,7 +109,7 @@ class WafDoctorCommand extends Command
         }
 
         foreach ($problems as $problem) {
-            $this->reportWarning($problem, 'Invalid values fall back to package defaults.');
+            $this->reportFailure($problem, 'Correct the configured value.');
         }
     }
 
@@ -129,6 +137,25 @@ class WafDoctorCommand extends Command
             return;
         }
 
+        $ruleIdsType = strtolower(Schema::getColumnType($table, 'rule_ids', true));
+        if (! str_contains($ruleIdsType, 'text') && ! str_contains($ruleIdsType, 'max')) {
+            $this->reportFailure(
+                "'{$table}.rule_ids' is too short for findings with many matched rules",
+                'Run: php artisan vendor:publish --tag=waf-migrations-upgrade && php artisan migrate'
+            );
+
+            return;
+        }
+
+        if (! UserIdColumnType::acceptsStrings(Schema::getColumnType($table, 'user_id', true))) {
+            $this->reportFailure(
+                "'{$table}.user_id' cannot store UUID or string user IDs",
+                'Run: php artisan vendor:publish --tag=waf-migrations-upgrade && php artisan migrate'
+            );
+
+            return;
+        }
+
         $this->reportPass("'{$table}' has every column the writer needs");
     }
 
@@ -143,7 +170,112 @@ class WafDoctorCommand extends Command
             return;
         }
 
+        $type = Schema::hasColumn('waf_exclusion_rules', 'created_by_user_id')
+            ? Schema::getColumnType('waf_exclusion_rules', 'created_by_user_id', true) : '';
+        if (! UserIdColumnType::acceptsStrings($type)) {
+            $this->reportWarning(
+                "'waf_exclusion_rules.created_by_user_id' cannot store UUID or string user IDs",
+                'Run: php artisan vendor:publish --tag=waf-migrations-upgrade && php artisan migrate'
+            );
+
+            return;
+        }
+
         $this->reportPass('Exclusion rules table is present');
+    }
+
+    private function checkPurgeWatermark(): void
+    {
+        if (! $this->tableExists('waf_purge_watermarks')) {
+            $this->reportFailure(
+                "The 'waf_purge_watermarks' table is missing — old queued findings can return after a purge",
+                'Run: php artisan vendor:publish --tag=waf-migrations-upgrade && php artisan migrate'
+            );
+
+            return;
+        }
+
+        $missing = $this->missingColumns('waf_purge_watermarks', ['table_name', 'purged_before']);
+        if ($missing !== []) {
+            $this->reportFailure(
+                "'waf_purge_watermarks' is missing ".implode(', ', $missing),
+                'Run the published purge-watermark migration.'
+            );
+
+            return;
+        }
+
+        $this->reportPass('Purge watermark table is present');
+    }
+
+    private function checkHitTable(): void
+    {
+        $connection = config('waf.queue.connection') ?? config('queue.default');
+        if (! config('waf.queue.enabled', false)
+            || config("queue.connections.{$connection}.driver", $connection) === 'sync') {
+            return;
+        }
+
+        $complete = true;
+        foreach ([
+            'waf_hit_events' => ['id', 'event_id', 'created_at'],
+            'waf_hit_totals' => ['event_id', 'hit_count', 'updated_at'],
+        ] as $table => $columns) {
+            if (! $this->tableExists($table)) {
+                $complete = false;
+                $this->reportFailure(
+                    "Queued hit counting needs the '{$table}' table",
+                    'Run: php artisan vendor:publish --tag=waf-migrations-upgrade && php artisan migrate'
+                );
+
+                continue;
+            }
+
+            $missing = $this->missingColumns($table, $columns);
+            if ($missing !== []) {
+                $complete = false;
+                $this->reportFailure(
+                    "Queued hit counting: '{$table}' is missing ".implode(', ', $missing),
+                    'Restore the missing columns from the published migration, then rerun waf:doctor.'
+                );
+            }
+        }
+
+        if ($complete) {
+            $this->reportPass('Queued hit-count tables are complete');
+        }
+    }
+
+    private function checkAttemptTable(): void
+    {
+        if (! config('waf.attempts.enabled', false)) {
+            return;
+        }
+
+        if ((string) config('app.key', '') === '') {
+            $this->reportFailure('Attempt recording needs APP_KEY', 'Set APP_KEY before enabling WAF_ATTEMPTS.');
+
+            return;
+        }
+
+        $table = (string) config('waf.attempts.table', 'waf_attempts');
+        if (! $this->tableExists($table)) {
+            $this->reportFailure(
+                "Attempt recording is enabled but '{$table}' is missing",
+                'Run: php artisan vendor:publish --tag=waf-migrations-attempts && php artisan migrate'
+            );
+
+            return;
+        }
+
+        $missing = $this->missingColumns($table, ['ip_address', 'rule_id', 'fingerprint', 'variant', 'window_id', 'created_at']);
+        if ($missing !== []) {
+            $this->reportFailure("'{$table}' is missing ".implode(', ', $missing), 'Run the attempt-table migration.');
+
+            return;
+        }
+
+        $this->reportPass('Attempt variant table is ready');
     }
 
     private function checkMiddleware(): void
@@ -158,6 +290,43 @@ class WafDoctorCommand extends Command
         }
 
         $this->reportPass('WAF middleware is wired up');
+    }
+
+    private function checkProxyTrust(): void
+    {
+        try {
+            $kernel = $this->laravel->make(HttpKernel::class);
+            foreach ($kernel->getGlobalMiddleware() as $middleware) {
+                if (! is_string($middleware) || ! is_a($middleware, TrustProxies::class, true)) {
+                    continue;
+                }
+
+                $proxies = (new \ReflectionMethod($middleware, 'proxies'))
+                    ->invoke($this->laravel->make($middleware)) ?: config('trustedproxy.proxies');
+                $configured = is_string($proxies) ? explode(',', $proxies) : (array) $proxies;
+
+                if (array_intersect(['*', '**'], array_map('trim', $configured)) !== []) {
+                    $this->reportWarning(
+                        'TrustProxies trusts any connecting proxy; WAF IP decisions may use spoofed X-Forwarded-For',
+                        'Ensure the app is reachable only through your proxy, or configure its trusted IP addresses.'
+                    );
+
+                    return;
+                }
+            }
+        } catch (\Throwable) {
+            // An unreadable proxy setup cannot be diagnosed reliably.
+        }
+    }
+
+    private function checkAttemptRetention(): void
+    {
+        if (config('waf.attempts.enabled', false) && ! config('waf.retention.enabled', false)) {
+            $this->reportWarning(
+                'Attempt recording is enabled without scheduled retention; variant rows will accumulate',
+                'Set WAF_RETENTION=true and run Laravel scheduler, or run waf:purge regularly.'
+            );
+        }
     }
 
     /**
@@ -252,37 +421,71 @@ class WafDoctorCommand extends Command
 
     private function checkCacheDriver(): void
     {
-        $store = (string) config('cache.default');
-        $driver = (string) config("cache.stores.{$store}.driver", $store);
-
-        switch ($driver) {
-            case 'null':
-                $this->reportWarning(
-                    "Cache driver '{$store}' stores nothing — flood detection, auto-ban and dedup silently do nothing",
-                    'Signature detection still works, but every duplicate finding writes its own row. Switch CACHE_STORE to redis, memcached or database.'
-                );
-
-                return;
-
-            case 'array':
-                $this->reportWarning(
-                    "Cache driver '{$store}' is per-process — flood counters and bans reset between requests",
-                    'Fine in tests; in production switch CACHE_STORE to redis or memcached.'
-                );
-
-                return;
-
-            case 'file':
-            case 'database':
-                $this->reportWarning(
-                    "Cache driver '{$store}' has no atomic increment — flood counting and dedup are approximate under concurrency",
-                    'Detection and logging are unaffected. For exact counting switch CACHE_STORE to redis or memcached.'
-                );
-
-                return;
+        $default = (string) config('cache.default');
+        $limiter = (string) (config('cache.limiter') ?: $default);
+        $stores = ['cache.default' => $default];
+        if ($limiter !== $default) {
+            $stores['cache.limiter'] = $limiter;
         }
 
-        $this->reportPass("Cache driver '{$store}' supports flood counting, bans and dedup");
+        foreach ($stores as $setting => $store) {
+            $definition = $store === 'null' ? ['driver' => 'null'] : config("cache.stores.{$store}");
+            if (! is_array($definition) || ! is_string($definition['driver'] ?? null) || $definition['driver'] === '') {
+                $this->reportFailure(
+                    "Cache store '{$store}' ({$setting}) is not configured",
+                    "Define it in cache.stores or change {$setting} to an existing store."
+                );
+
+                continue;
+            }
+
+            $driver = $definition['driver'];
+            try {
+                Cache::store($store);
+            } catch (\Throwable) {
+                $this->reportFailure(
+                    "Cache store '{$store}' ({$setting}) cannot be resolved",
+                    "Check its driver and dependencies in cache.stores.{$store}."
+                );
+
+                continue;
+            }
+
+            $role = $setting === 'cache.limiter' ? 'flood counters and ban strikes'
+                : ($limiter === $default ? 'flood counters, ban strikes, bans and dedup' : 'bans and dedup');
+
+            switch ($driver) {
+                case 'null':
+                    $this->reportWarning(
+                        "Cache store '{$store}' ({$setting}) stores nothing — {$role} do not persist",
+                        "Switch {$setting} to redis, memcached or database."
+                    );
+
+                    break;
+
+                case 'array':
+                    $this->reportWarning(
+                        "Cache store '{$store}' ({$setting}) is per-process — {$role} reset between requests",
+                        "Fine in tests; in production switch {$setting} to a shared store."
+                    );
+
+                    break;
+
+                case 'file':
+                case 'database':
+                    $counting = $setting === 'cache.limiter' ? 'flood and strike counting'
+                        : ($limiter === $default ? 'flood, strike and dedup counting' : 'dedup counting');
+                    $this->reportWarning(
+                        "Cache store '{$store}' ({$setting}) has no atomic increment — {$counting} may be approximate under concurrency",
+                        "For exact counting switch {$setting} to redis or memcached."
+                    );
+
+                    break;
+
+                default:
+                    $this->reportPass("Cache store '{$store}' ({$setting}) supports {$role}");
+            }
+        }
     }
 
     // ── output ──────────────────────────────────────────────────────────────
@@ -391,14 +594,8 @@ class WafDoctorCommand extends Command
         try {
             $router = $this->laravel->make(Router::class);
 
-            foreach ($router->getMiddlewareGroups() as $group) {
-                if (array_intersect($needles, array_filter((array) $group, 'is_string')) !== []) {
-                    return true;
-                }
-            }
-
             foreach ($router->getRoutes()->getRoutes() as $route) {
-                if (array_intersect($needles, array_filter($route->gatherMiddleware(), 'is_string')) !== []) {
+                if (in_array(WafMiddleware::class, $router->gatherRouteMiddleware($route), true)) {
                     return true;
                 }
             }

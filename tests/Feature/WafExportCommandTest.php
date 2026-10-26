@@ -3,7 +3,7 @@
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 
-function seedExportFinding(string $ip, string $level, int $hits = 1, ?string $createdAt = null): void
+function seedExportFinding(string $ip, string $level, int $hits = 1, ?string $createdAt = null, string $action = 'logged'): void
 {
     DB::table('waf_logs')->insert([
         'ip_address' => $ip,
@@ -12,6 +12,7 @@ function seedExportFinding(string $ip, string $level, int $hits = 1, ?string $cr
         'category' => 'sqli',
         'threat_level' => $level,
         'hit_count' => $hits,
+        'action_taken' => $action,
         'created_at' => $createdAt ?? now(),
         'updated_at' => now(),
     ]);
@@ -37,6 +38,16 @@ it('excludes IPs below the minimum severity', function () {
     Artisan::call('waf:export', ['--min-level' => 'error']);
 
     expect(Artisan::output())->not->toContain('203.0.113.20');
+});
+
+it('does not export accepted false positives or count their hits', function () {
+    seedExportFinding('203.0.113.21', 'critical', hits: 20, action: 'excluded');
+    seedExportFinding('203.0.113.22', 'critical', hits: 20, action: 'excluded');
+    seedExportFinding('203.0.113.22', 'error', hits: 2);
+
+    Artisan::call('waf:export', ['--min-hits' => 3]);
+
+    expect(Artisan::output())->not->toContain('203.0.113.21', '203.0.113.22');
 });
 
 it('excludes IPs below the minimum hit count', function () {
@@ -94,6 +105,18 @@ it('rejects an unknown format', function () {
     expect(Artisan::call('waf:export', ['--format' => 'bogus']))->toBe(2);
 });
 
+it('rejects invalid numeric filters instead of widening the exported blocklist', function (string $option, string $value) {
+    seedExportFinding('203.0.113.80', 'critical', hits: 10);
+
+    expect(Artisan::call('waf:export', [$option => $value]))->toBe(2)
+        ->and(Artisan::output())->not->toContain('203.0.113.80');
+})->with([
+    ['--days', 'invalid'],
+    ['--min-hits', 'invalid'],
+    ['--limit', 'invalid'],
+    ['--days', '-1'],
+]);
+
 it('renders the fail2ban set-banip format with the default jail', function () {
     seedExportFinding('203.0.113.90', 'critical', hits: 10);
 
@@ -117,4 +140,24 @@ it('rejects a jail name that could break out of the shell command', function () 
 
     expect($status)->toBe(2)
         ->and(Artisan::output())->not->toContain('203.0.113.92');
+});
+
+it('excludes invalid IP addresses from shell-ready exports', function () {
+    seedExportFinding('203.0.113.1;echo injected', 'critical', hits: 20);
+    seedExportFinding('2001:db8::1', 'critical', hits: 10);
+
+    Artisan::call('waf:export', ['--format' => 'fail2ban']);
+
+    expect(Artisan::output())->toContain('banip 2001:db8::1')
+        ->not->toContain('injected');
+});
+
+it('fills the export limit with valid IPs after skipping malformed rows', function () {
+    seedExportFinding('203.0.113.1;echo injected', 'critical', hits: 20);
+    seedExportFinding('203.0.113.10', 'critical', hits: 10);
+
+    Artisan::call('waf:export', ['--format' => 'fail2ban', '--limit' => 1]);
+
+    expect(Artisan::output())->toContain('banip 203.0.113.10')
+        ->not->toContain('injected');
 });

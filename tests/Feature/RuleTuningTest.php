@@ -19,6 +19,27 @@ it('silences a whole category via disabled_categories', function () {
     expect(DB::table('waf_logs')->count())->toBe(0);
 });
 
+it('silences scanner signals via disabled rule or category', function (string $setting, string $value) {
+    config()->set("waf.{$setting}", [$value]);
+
+    $this->get('/', ['User-Agent' => 'sqlmap/1.7'])->assertOk();
+
+    expect(DB::table('waf_logs')->count())->toBe(0);
+})->with([
+    ['disabled_rules', '913100'],
+    ['disabled_categories', 'scanner'],
+]);
+
+it('silences bot and flood signals via disabled categories', function () {
+    config()->set('waf.disabled_categories', ['bot', 'ddos']);
+    config()->set('waf.ddos.threshold', 1);
+
+    $this->get('/', ['User-Agent' => 'curl/8.0'])->assertOk();
+    $this->get('/', ['User-Agent' => 'curl/8.0'])->assertOk();
+
+    expect(DB::table('waf_logs')->count())->toBe(0);
+});
+
 it('runs broad rules at paranoia level 2 (default)', function () {
     // 930100 (../) is a broad rule; on its own it should still be caught at PL2.
     $this->get('/?p='.rawurlencode('../secret'))->assertOk();

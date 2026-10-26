@@ -1,7 +1,9 @@
 <?php
 
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\View;
 use Tuijncode\LaravelWaf\Events\RequestBlocked;
 
 $attack = fn () => '/?q='.rawurlencode("' UNION SELECT * FROM users--");
@@ -32,6 +34,25 @@ it('forces JSON when always_json is set', function () use ($attack) {
     $this->get($attack(), ['User-Agent' => 'sqlmap/1.7'])
         ->assertStatus(403)
         ->assertJson(['message' => 'Forbidden']);
+});
+
+it('keeps an attack blocked when the custom block view fails', function () use ($attack) {
+    config()->set('waf.block_response.view', 'waf.block');
+    config()->set('waf.block_response.status', 418);
+    View::shouldReceive('exists')->with('waf.block')->andReturn(true);
+    View::shouldReceive('make')->with('waf.block', Mockery::any())->andThrow(new RuntimeException('view failed'));
+
+    $this->get($attack())->assertStatus(418)->assertSee('Forbidden');
+});
+
+it('keeps a standing ban when the custom block view fails', function () {
+    config()->set('waf.auto_ban.enabled', true);
+    config()->set('waf.block_response.view', 'waf.block');
+    Cache::put('laravel-waf|ban|'.sha1('127.0.0.1'), true, 60);
+    View::shouldReceive('exists')->with('waf.block')->andReturn(true);
+    View::shouldReceive('make')->with('waf.block', Mockery::any())->andThrow(new RuntimeException('view failed'));
+
+    $this->get('/')->assertForbidden()->assertHeader('Retry-After');
 });
 
 it('dispatches the RequestBlocked event when blocking', function () use ($attack) {

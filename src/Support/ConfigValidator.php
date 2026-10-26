@@ -37,7 +37,6 @@ class ConfigValidator
         $this->intRange($problems, 'waf.block_confidence', 0, 100);
         $this->intRange($problems, 'waf.block_response.status', 100, 599);
         $this->intRange($problems, 'waf.dedup_minutes', 0, 1440);
-        $this->intRange($problems, 'waf.dedup_flush_seconds', 0, 3600);
 
         $this->positiveInt($problems, 'waf.ddos.threshold');
         $this->positiveInt($problems, 'waf.ddos.window');
@@ -45,11 +44,26 @@ class ConfigValidator
         $this->positiveInt($problems, 'waf.auto_ban.max_blocks');
         $this->positiveInt($problems, 'waf.auto_ban.window');
         $this->positiveInt($problems, 'waf.auto_ban.duration');
+        $this->positiveInt($problems, 'waf.retention.days');
+        $this->positiveInt($problems, 'waf.attempts.retention_days');
+        foreach (['window_minutes', 'max_per_ip'] as $key) {
+            if (config("waf.attempts.{$key}") !== null) {
+                $this->positiveInt($problems, "waf.attempts.{$key}");
+            }
+        }
+        if (config('waf.attempts.max_correlation_rows') !== null) {
+            $this->intRange($problems, 'waf.attempts.max_correlation_rows', 1, 100000);
+        }
 
         $this->environments($problems);
+        $this->pathLists($problems);
         $this->knownCategories($problems);
         $this->customPatterns($problems);
         $this->safeFields($problems);
+
+        if (config('waf.redact.enabled', true) && (string) config('app.key', '') === '') {
+            $problems[] = 'APP_KEY is required for keyed hashes of redacted WAF targets.';
+        }
 
         return $problems;
     }
@@ -84,6 +98,19 @@ class ConfigValidator
         if ($environments !== null && ! is_array($environments)) {
             $problems[] = 'waf.enabled_environments must be null or an array of environment names, got '
                 .$this->show($environments).'.';
+        } elseif (is_array($environments) && array_filter($environments, 'is_string') !== $environments) {
+            $problems[] = 'waf.enabled_environments entries must be environment names.';
+        }
+    }
+
+    /** @param array<int, string> $problems */
+    private function pathLists(array &$problems): void
+    {
+        foreach (['only_paths', 'skip_paths'] as $name) {
+            $paths = config("waf.{$name}");
+            if (! is_array($paths) || array_filter($paths, 'is_string') !== $paths) {
+                $problems[] = "waf.{$name} must be an array of path patterns.";
+            }
         }
     }
 
@@ -110,22 +137,36 @@ class ConfigValidator
                 continue;
             }
 
+            if (isset($definition['label']) && ! is_string($definition['label'])) {
+                $problems[] = "custom pattern '{$regex}' label must be a string.";
+            }
+
             $severity = $definition['severity'] ?? null;
             if ($severity !== null && ! in_array($severity, self::SEVERITIES, true)) {
-                $problems[] = "custom pattern '{$regex}' has unknown severity '{$severity}'"
+                $problems[] = "custom pattern '{$regex}' has unknown severity ".$this->show($severity)
                     .' (allowed: '.implode(', ', self::SEVERITIES).').';
             }
 
-            foreach ((array) ($definition['targets'] ?? []) as $target) {
-                if (! in_array($target, self::SURFACES, true)) {
-                    $problems[] = "custom pattern '{$regex}' targets unknown surface '{$target}'"
-                        .' (known: '.implode(', ', self::SURFACES).').';
+            if (isset($definition['targets']) && (! is_array($definition['targets']) || $definition['targets'] === [])) {
+                $problems[] = "custom pattern '{$regex}' targets must be a non-empty array.";
+            } else {
+                foreach ($definition['targets'] ?? [] as $target) {
+                    if (! in_array($target, self::SURFACES, true)) {
+                        $problems[] = "custom pattern '{$regex}' targets unknown surface ".$this->show($target)
+                            .' (known: '.implode(', ', self::SURFACES).').';
+                    }
                 }
             }
 
             $validator = $definition['validator'] ?? null;
-            if ($validator !== null && ! Validators::known((string) $validator)) {
-                $problems[] = "custom pattern '{$regex}' names unknown validator '{$validator}'.";
+            if ($validator !== null && (! is_string($validator) || ! Validators::known($validator))) {
+                $problems[] = "custom pattern '{$regex}' names unknown validator ".$this->show($validator).'.';
+            }
+            if (isset($definition['paranoia'])) {
+                $paranoia = filter_var($definition['paranoia'], FILTER_VALIDATE_INT);
+                if ($paranoia === false || $paranoia < 1 || $paranoia > 4) {
+                    $problems[] = "custom pattern '{$regex}' paranoia must be an integer between 1 and 4.";
+                }
             }
         }
     }
@@ -188,7 +229,7 @@ class ConfigValidator
     {
         $core = array_map(fn (Signature $s): string => $s->category, CoreRuleSet::rules());
 
-        return array_values(array_unique(array_merge($core, ['custom', 'scanner', 'bot', 'ddos'])));
+        return array_values(array_unique(array_merge($core, ['custom', 'scanner', 'bot', 'ddos', 'ai_probe', 'probe', 'llm_injection'])));
     }
 
     private function show(mixed $value): string

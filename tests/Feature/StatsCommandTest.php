@@ -42,3 +42,11 @@ it('ignores findings outside the window', function () {
         ->expectsOutputToContain('WAF findings in the last 7 day(s): 0')
         ->assertSuccessful();
 });
+
+it('rejects invalid day windows', function () {
+    foreach (['abc', '0', '-1'] as $days) {
+        $this->artisan('waf:stats', ['--days' => $days])
+            ->expectsOutputToContain('--days must be a positive integer.')
+            ->assertExitCode(2);
+    }
+});

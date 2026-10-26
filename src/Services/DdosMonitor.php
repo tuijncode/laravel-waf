@@ -3,6 +3,7 @@
 namespace Tuijncode\LaravelWaf\Services;
 
 use Illuminate\Support\Facades\RateLimiter;
+use Tuijncode\LaravelWaf\Support\CacheFailure;
 
 /**
  * Volumetric abuse detector.
@@ -29,7 +30,11 @@ class DdosMonitor
      */
     public function hit(string $client): void
     {
-        RateLimiter::hit($this->bucket($client), $this->windowSeconds);
+        try {
+            RateLimiter::hit($this->bucket($client), $this->windowSeconds);
+        } catch (\Throwable $e) {
+            CacheFailure::report($e);
+        }
     }
 
     /**
@@ -37,7 +42,13 @@ class DdosMonitor
      */
     public function tripped(string $client): bool
     {
-        return RateLimiter::attempts($this->bucket($client)) > $this->ceiling;
+        try {
+            return RateLimiter::attempts($this->bucket($client)) > $this->ceiling;
+        } catch (\Throwable $e) {
+            CacheFailure::report($e);
+
+            return false;
+        }
     }
 
     public function ceiling(): int

@@ -234,7 +234,7 @@ class CoreRuleSet
                 'description' => 'XSS Attack: <script> tag detected',
                 'severity' => 'critical',
                 'targets' => ['query', 'body', 'path', 'headers'],
-                'regex' => '/<script\b[^>]*>|<\/script\s*>/i',
+                'regex' => '/<script(?=[\s\/>])|<\/script\s*>/i',
             ],
             [
                 'id' => '941110',

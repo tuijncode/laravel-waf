@@ -1,6 +1,10 @@
 <?php
 
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Tuijncode\LaravelWaf\Services\ExclusionRuleService;
+use Tuijncode\LaravelWaf\Services\InspectionResult;
+use Tuijncode\LaravelWaf\Services\WafInspector;
 
 beforeEach(fn () => config()->set('waf.mode', 'blocking'));
 
@@ -76,4 +80,65 @@ it('blocks a flood on the volumetric signal when ddos.block is on', function () 
 
     expect(DB::table('waf_logs')->where('category', 'ddos')->where('action_taken', 'blocked')->count())
         ->toBeGreaterThan(0);
+});
+
+it('does not scan requests after the flood block threshold', function () {
+    config()->set('waf.ddos.threshold', 1);
+    config()->set('waf.ddos.block', true);
+    $inspector = new class extends WafInspector
+    {
+        public int $scans = 0;
+
+        public function inspect(Request $request): InspectionResult
+        {
+            $this->scans++;
+
+            return parent::inspect($request);
+        }
+    };
+    $this->app->instance(WafInspector::class, $inspector);
+
+    $this->get('/?q=hi')->assertOk();
+    $this->get('/?q=hi')->assertForbidden();
+    $this->get('/?q=hi')->assertForbidden();
+
+    expect($inspector->scans)->toBe(1)
+        ->and(DB::table('waf_logs')->where('category', 'ddos')->value('hit_count'))->toBe(2);
+});
+
+it('redacts unscanned flood evidence before storing it', function () {
+    config()->set('waf.ddos.threshold', 1);
+    config()->set('waf.ddos.block', true);
+
+    $this->get('/?q=hi')->assertOk();
+    $this->get('/?q=AKIAIOSFODNN7EXAMPLE')->assertForbidden();
+
+    $log = DB::table('waf_logs')->where('category', 'ddos')->sole();
+    expect($log->url)->toBe('[REDACTED]')
+        ->and($log->payload)->toBe('[REDACTED]')
+        ->and($log->user_agent)->toBe('[REDACTED]');
+});
+
+it('still scans a flood when its signal is excluded', function () {
+    config()->set('waf.ddos.threshold', 1);
+    config()->set('waf.ddos.block', true);
+    app(ExclusionRuleService::class)->add('912100');
+
+    $this->get('/?q=hi')->assertOk();
+    $this->get('/?q='.rawurlencode("' UNION SELECT * FROM users--"))->assertForbidden();
+
+    expect(DB::table('waf_logs')->where('action_taken', 'blocked')->value('rule_ids'))
+        ->toContain('942100');
+});
+
+it('still scans when the flood alone is below the minimum confidence', function () {
+    config()->set('waf.ddos.threshold', 1);
+    config()->set('waf.ddos.block', true);
+    config()->set('waf.min_confidence', 30);
+
+    $this->get('/?q=hi')->assertOk();
+    $this->get('/?q='.rawurlencode("' UNION SELECT * FROM users--"))->assertForbidden();
+
+    expect(DB::table('waf_logs')->where('action_taken', 'blocked')->value('rule_ids'))
+        ->toContain('942100');
 });

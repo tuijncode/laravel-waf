@@ -43,3 +43,30 @@ it('returns a zero score for a clean request', function () {
     expect($scorer->calculate([])['score'])->toBe(0)
         ->and($scorer->calculate([])['label'])->toBe('none');
 });
+
+it('distinguishes a validator regex failure from no match', function () {
+    $limit = ini_get('pcre.backtrack_limit');
+    ini_set('pcre.backtrack_limit', '100');
+
+    try {
+        $rule = new Signature('TEST', 'custom', 'Test', 'Test', 'error', ['query'], '/(a+)+$/', validator: 'luhn');
+        expect(fn () => $rule->match(str_repeat('a', 40).'!'))
+            ->toThrow(RuntimeException::class, 'Backtrack limit exhausted');
+    } finally {
+        ini_set('pcre.backtrack_limit', $limit);
+    }
+});
+
+it('checks later validator candidates without collecting them all', function () {
+    $rule = new Signature('TEST', 'custom', 'Test', 'Test', 'error', ['body'], '/\b\d{16}\b/', validator: 'luhn');
+    $subject = str_repeat('1234567890123456 ', 10000).'4111111111111111';
+
+    expect($rule->match($subject))->toBe('4111111111111111');
+});
+
+it('bounds rejected validator candidates in short and long subjects', function (int $length) {
+    $rule = new Signature('TEST', 'custom', 'Test', 'Test', 'warning', ['body'], '/0/', validator: 'luhn');
+
+    expect(fn () => $rule->match(str_repeat('0', $length)))
+        ->toThrow(OverflowException::class, 'validation candidate limit exceeded');
+})->with([30000, 100000]);

@@ -14,10 +14,11 @@ return new class extends Migration
             $table->string('ip_address')->index();
             $table->string('method', 10)->nullable();
             $table->text('url');
+            $table->string('target_hash', 64)->nullable()->index();
             $table->string('user_agent', 500)->nullable();
             $table->text('type');
             $table->string('category', 30)->index();
-            $table->string('rule_ids')->nullable();
+            $table->text('rule_ids')->nullable();
             $table->text('payload')->nullable();
             $table->string('threat_level', 20)->default('notice')->index();
             $table->unsignedSmallInteger('anomaly_score')->default(0);
@@ -25,7 +26,7 @@ return new class extends Migration
             $table->string('confidence_label', 20)->default('none');
             $table->string('action_taken', 20)->default('logged');
             $table->unsignedInteger('hit_count')->default(1);
-            $table->unsignedBigInteger('user_id')->nullable()->index();
+            $table->string('user_id', 191)->nullable()->index();
             $table->timestamps();
 
             // Purge, stats and correlation analytics all filter on created_at;

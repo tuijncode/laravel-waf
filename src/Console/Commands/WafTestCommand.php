@@ -45,7 +45,7 @@ class WafTestCommand extends Command
 
         $this->renderMatches($result->matches);
         $this->renderSignals($result);
-        $this->renderScore($result);
+        $this->renderScore($result, $inspector, $request);
 
         return self::SUCCESS;
     }
@@ -77,12 +77,15 @@ class WafTestCommand extends Command
                 return null;
             }
             [$name, $value] = explode(':', (string) $header, 2);
-            $server['HTTP_'.strtoupper(str_replace('-', '_', trim($name)))] = trim($value);
+            $name = strtoupper(str_replace('-', '_', trim($name)));
+            $server[in_array($name, ['CONTENT_TYPE', 'CONTENT_LENGTH'], true) ? $name : 'HTTP_'.$name] = trim($value);
         }
 
         $content = $this->option('body');
 
-        return Request::create($uri, $method, [], [], [], $server, $content !== null ? (string) $content : null);
+        return Request::createFromBase(Request::create(
+            $uri, $method, [], [], [], $server, $content !== null ? (string) $content : null
+        ));
     }
 
     /**
@@ -126,22 +129,22 @@ class WafTestCommand extends Command
         }
     }
 
-    private function renderScore(InspectionResult $result): void
+    private function renderScore(InspectionResult $result, WafInspector $inspector, Request $request): void
     {
         $score = $result->confidenceScore();
         $blockAt = (int) config('waf.block_confidence', 60);
         $mode = (string) config('waf.mode', 'detection');
-        $wouldBlock = $mode === 'blocking' && $score >= $blockAt;
+        $wouldBlock = $inspector->wouldBlock($request, $result);
 
         $this->newLine();
         $this->line("Confidence: <info>{$score}</info> ({$result->confidenceLabel()})   "
             ."Anomaly: <info>{$result->anomalyScore()}</info>   "
             ."Severity: <info>{$result->severity()}</info>");
-        $this->line("Block threshold: {$blockAt} · mode: {$mode} → "
+        $this->line("Block threshold: {$blockAt} · mode: {$mode} · if inspected → "
             .($wouldBlock
                 ? '<error> would BLOCK </error>'
-                : ($score >= $blockAt
-                    ? '<comment>over threshold, but logged (detection mode)</comment>'
-                    : '<info>logged only</info>')));
+                : ($score < (int) config('waf.min_confidence', 10)
+                    ? '<info>below minimum confidence, ignored</info>'
+                    : '<info>not blocked</info>')));
     }
 }

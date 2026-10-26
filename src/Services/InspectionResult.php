@@ -31,6 +31,29 @@ class InspectionResult
         return ! empty($this->matches) || $this->isScanner || $this->isBot || $this->isDdos;
     }
 
+    /** Preserve the verdict while removing request evidence before queue serialization. */
+    public function withoutMatchedValues(): self
+    {
+        return new self(
+            matches: array_map(fn (SignatureMatch $match): SignatureMatch => new SignatureMatch(
+                id: $match->id,
+                category: $match->category,
+                name: $match->name,
+                description: $match->description,
+                severity: $match->severity,
+                context: $match->context,
+                matched: '[REDACTED]',
+                decisive: $match->decisive,
+            ), $this->matches),
+            isScanner: $this->isScanner,
+            scannerName: $this->scannerName,
+            isBot: $this->isBot,
+            botName: $this->botName,
+            isDdos: $this->isDdos,
+            confidence: $this->confidence,
+        );
+    }
+
     public function anomalyScore(): int
     {
         return $this->confidence['anomaly_score'] ?? 0;
@@ -105,6 +128,37 @@ class InspectionResult
      */
     public function ruleIds(): array
     {
-        return array_values(array_unique(array_map(fn (SignatureMatch $m) => $m->id, $this->matches)));
+        $ids = array_map(fn (SignatureMatch $m) => $m->id, $this->matches);
+        if ($this->isScanner) {
+            $ids[] = '913100';
+        }
+        if ($this->isBot) {
+            $ids[] = '913110';
+        }
+        if ($this->isDdos) {
+            $ids[] = '912100';
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    /** @return array<int, string> */
+    public function signatures(): array
+    {
+        $signatures = array_map(
+            fn (SignatureMatch $match): string => "[{$match->id}] {$match->description}",
+            $this->matches,
+        );
+        if ($this->isScanner) {
+            $signatures[] = "[913100] Scanner detected: {$this->scannerName}";
+        }
+        if ($this->isBot) {
+            $signatures[] = "[913110] Automated client detected: {$this->botName}";
+        }
+        if ($this->isDdos) {
+            $signatures[] = '[912100] Rate threshold exceeded (possible DoS)';
+        }
+
+        return $signatures;
     }
 }
